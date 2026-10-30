@@ -1,0 +1,15 @@
+[package]
+name = "wgpu-rq-test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Phase 0 check: does wgpu's experimental ray query path run on this PC's GPU?
+# wgpu is pinned to the exact commit Firefox vendors (gfx/wgpu_bindings/Cargo.toml),
+# so a pass here means the same wgpu code Firefox ships can trace rays on this GPU.
+[dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "49325ca0a13bdc0787b1601138096cce743dd29e", default-features = false, features = ["std", "dx12", "vulkan", "wgsl"] }
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
