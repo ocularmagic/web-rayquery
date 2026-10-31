@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ray query smoke test</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --ok: #1b7f3b; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #e8e8e8; --ok: #6ccf8e; --bad: #f2827a; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.45 ui-monospace, Consolas, monospace; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<h1>Ray query smoke test</h1>
+<p>Needs a Firefox build with the web-rayquery patch and
+<code>dom.webgpu.experimental-ray-query.enabled</code> set to true.</p>
+<p id="status">Running...</p>
+<pre id="out"></pre>
+<script type="module">
+// Phase 2 check, same scene as wgpu-rq-test (Phase 0): one triangle at z = 0,
+// a 16x16 grid of rays fired down -z from z = 2 m, hits compared with a CPU
+// (Moller-Trumbore) trace. Lines are also logged with a "RAYQUERY" prefix so
+// a terminal can read them (Firefox: devtools.console.stdout.content=true).
+const out = document.getElementById('out');
+const status = document.getElementById('status');
+const log = (line) => { out.textContent += line + '\n'; console.log('RAYQUERY ' + line); };
+const finish = (ok, msg) => {
+  status.textContent = msg;
+  status.className = ok ? 'ok' : 'bad';
+  log('RESULT ' + (ok ? 'PASS' : 'FAIL') + ' ' + msg);
+};
+
+const GRID = 16;
+const HALF_SIZE = 1.5; // metres
+const CUSTOM_DATA = 7;
+const VERTICES = [[-1, -1, 0], [1, -1, 0], [0, 1, 0]];
+
+const SHADER = `
+enable wgpu_ray_query;
+
+struct Params { grid: u32, half_size: f32 }
+struct Hit { kind: u32, t: f32, bary: vec2<f32>, custom_data: u32, primitive_index: u32, front_face: u32, _pad: u32 }
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var acc_struct: acceleration_structure;
+@group(0) @binding(2) var<storage, read_write> hits: array<Hit>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if id.x >= params.grid || id.y >= params.grid { return; }
+  let cell = 2.0 * params.half_size / f32(params.grid);
+  let x = -params.half_size + (f32(id.x) + 0.5) * cell;
+  let y = params.half_size - (f32(id.y) + 0.5) * cell;
+  var rq: ray_query;
+  rayQueryInitialize(&rq, acc_struct, RayDesc(0u, 0xFFu, 0.001, 100.0, vec3<f32>(x, y, 2.0), vec3<f32>(0.0, 0.0, -1.0)));
+  rayQueryProceed(&rq);
+  let i = rayQueryGetCommittedIntersection(&rq);
+  var h: Hit;
+  h.kind = i.kind;
+  if i.kind != RAY_QUERY_INTERSECTION_NONE {
+    h.t = i.t;
+    h.bary = i.barycentrics;
+    h.custom_data = i.instance_custom_data;
+    h.primitive_index = i.primitive_index;
+    h.front_face = select(0u, 1u, i.front_face);
+  }
+  hits[id.y * params.grid + id.x] = h;
+}`;
+
+// CPU reference: ray from (x, y, 2) towards -z against the triangle.
+function cpuTrace(x, y) {
+  const [a, b, c] = VERTICES;
+  const o = [x, y, 2], d = [0, 0, -1];
+  const sub = (p, q) => [p[0] - q[0], p[1] - q[1], p[2] - q[2]];
+  const cross = (p, q) => [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+  const dot = (p, q) => p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+  const e1 = sub(b, a), e2 = sub(c, a);
+  const p = cross(d, e2);
+  const det = dot(e1, p);
+  if (Math.abs(det) < 1e-8) return null;
+  const inv = 1 / det;
+  const s = sub(o, a);
+  const u = dot(s, p) * inv;
+  if (u < 0 || u > 1) return null;
+  const q = cross(s, e1);
+  const v = dot(d, q) * inv;
+  if (v < 0 || u + v > 1) return null;
+  const t = dot(e2, q) * inv;
+  return t > 0.001 && t < 100 ? { t, u, v } : null;
+}
+
+try {
+  log('userAgent: ' + navigator.userAgent);
+  if (!navigator.gpu) throw new Error('navigator.gpu is missing');
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('requestAdapter returned null');
+  const hasFeature = adapter.features.has('experimental-ray-query');
+  log('adapter has experimental-ray-query: ' + hasFeature);
+  log('API present: createBlas=' + (typeof GPUDevice.prototype.createBlas) +
+      ' buildAccelerationStructures=' + (typeof GPUCommandEncoder.prototype.buildAccelerationStructures) +
+      ' GPUBufferUsage.BLAS_INPUT=' + GPUBufferUsage.BLAS_INPUT);
+  if (!hasFeature) throw new Error('adapter does not offer experimental-ray-query (pref off, or GPU lacks ray queries)');
+
+  const device = await adapter.requestDevice({ requiredFeatures: ['experimental-ray-query'] });
+  log('device features: ' + [...device.features].sort().join(', '));
+  device.addEventListener('uncapturederror', (e) => log('uncapturederror: ' + e.error.message));
+  device.pushErrorScope('validation');
+
+  // Triangle vertex buffer (float32x3), usable as BLAS build input.
+  const vertexData = new Float32Array(VERTICES.flat());
+  const vertexBuffer = device.createBuffer({
+    size: vertexData.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.BLAS_INPUT,
+  });
+  device.queue.writeBuffer(vertexBuffer, 0, vertexData);
+
+  const blas = device.createBlas({
+    label: 'triangle',
+    geometries: [{ vertexFormat: 'float32x3', vertexCount: 3 }],
+  });
+  const tlas = device.createTlas({ label: 'scene', maxInstances: 1 });
+  log('created GPUBlas and GPUTlas (maxInstances=' + tlas.maxInstances + ')');
+
+  const params = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const paramData = new ArrayBuffer(8);
+  new Uint32Array(paramData, 0, 1)[0] = GRID;
+  new Float32Array(paramData, 4, 1)[0] = HALF_SIZE;
+  device.queue.writeBuffer(params, 0, paramData);
+
+  const HIT_SIZE = 32;
+  const hitsBuffer = device.createBuffer({ size: GRID * GRID * HIT_SIZE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const readback = device.createBuffer({ size: GRID * GRID * HIT_SIZE, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+  const module = device.createShaderModule({ code: SHADER });
+  const info = await module.getCompilationInfo();
+  for (const m of info.messages) log(`shader ${m.type}: ${m.message} (line ${m.lineNum})`);
+
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, accelerationStructure: {} },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ] });
+  const pipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+    compute: { module, entryPoint: 'main' },
+  });
+  const bindGroup = device.createBindGroup({ layout, entries: [
+    { binding: 0, resource: { buffer: params } },
+    { binding: 1, resource: tlas },
+    { binding: 2, resource: { buffer: hitsBuffer } },
+  ] });
+
+  const enc = device.createCommandEncoder();
+  enc.buildAccelerationStructures(
+    [{ blas, geometries: [{ vertexBuffer, vertexStride: 12 }] }],
+    [{ tlas, instances: [{ blas, customData: CUSTOM_DATA }] }],
+  );
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(GRID / 8, GRID / 8);
+  pass.end();
+  enc.copyBufferToBuffer(hitsBuffer, 0, readback, 0, readback.size);
+  device.queue.submit([enc.finish()]);
+
+  const err = await device.popErrorScope();
+  if (err) throw new Error('validation error: ' + err.message);
+
+  await readback.mapAsync(GPUMapMode.READ);
+  const raw = readback.getMappedRange();
+  const u32 = new Uint32Array(raw), f32 = new Float32Array(raw);
+
+  let gpuHits = 0, cpuHits = 0, mismatches = 0, maxTErr = 0;
+  const rows = [];
+  const cell = 2 * HALF_SIZE / GRID;
+  for (let iy = 0; iy < GRID; iy++) {
+    let row = '';
+    for (let ix = 0; ix < GRID; ix++) {
+      const base = (iy * GRID + ix) * (HIT_SIZE / 4);
+      const kind = u32[base];
+      const gpuHit = kind !== 0;
+      const x = -HALF_SIZE + (ix + 0.5) * cell;
+      const y = HALF_SIZE - (iy + 0.5) * cell;
+      const cpu = cpuTrace(x, y);
+      gpuHits += gpuHit; cpuHits += !!cpu;
+      if (gpuHit !== !!cpu) {
+        mismatches++;
+      } else if (gpuHit) {
+        maxTErr = Math.max(maxTErr, Math.abs(f32[base + 1] - cpu.t));
+        if (u32[base + 4] !== CUSTOM_DATA) mismatches++;
+      }
+      row += gpuHit ? '#' : '.';
+    }
+    rows.push(row);
+  }
+  readback.unmap();
+  log('GPU hit map (16x16, # = hit):\n' + rows.join('\n'));
+  log(`gpu hits=${gpuHits} cpu hits=${cpuHits} mismatches=${mismatches} max |t error|=${maxTErr.toExponential(2)} m`);
+  const ok = mismatches === 0 && gpuHits > 0 && maxTErr < 1e-4;
+  finish(ok, ok ? `hardware ray queries match the CPU trace (${gpuHits} hits)` : 'GPU and CPU results differ');
+} catch (e) {
+  finish(false, String(e && e.message || e));
+}
+</script>
+</body>
+</html>

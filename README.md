@@ -10,7 +10,7 @@ Background: [gpuweb#535](https://github.com/gpuweb/gpuweb/issues/535) (ray traci
 |---|---|---|
 | 0 | Check wgpu/Firefox support; run wgpu ray queries natively | Done |
 | 1 | Build Firefox unmodified | Done |
-| 2 | Pref-gated ray query API in Firefox (WebIDL, dom/webgpu, IPC, wgpu_bindings) | Not started |
+| 2 | Pref-gated ray query API in Firefox (WebIDL, dom/webgpu, IPC, wgpu_bindings) | Done (Windows, DX12) |
 | 3 | Test page (plain WebGPU) tracing rays vs a software result | Not started |
 | 4 | Write-up | Maybe |
 
@@ -32,6 +32,64 @@ Background: [gpuweb#535](https://github.com/gpuweb/gpuweb/issues/535) (ray traci
 - [`pages/webgpu-check.html`](pages/webgpu-check.html) (adapter, features, compute round trip) passes in the build. The GPU process loads `d3d12.dll` + `dxcompiler.dll` and no `vulkan-1.dll`: WebGPU runs on **DX12** by default. `adapter.info` fields are blank (Firefox hides them).
 - `--setpref dom.webgpu.wgpu-backend=vulkan` does switch wgpu to Vulkan (wgpu logs `backend: Vulkan`), but the same check then fails ("Buffer unmapped") and the log shows GPU-process `AbnormalShutdown` messages. Not investigated; DX12 is the path for this prototype.
 - Notes: mach limits its terminal output when it detects an AI agent (full log in `obj-*/.mozbuild/logs/build/`). Firefox prints page `console.log` to stdout with `--setpref devtools.console.stdout.content=true`, and honours `RUST_LOG` for wgpu logs.
+
+## Phase 2: the Firefox patch (October 2026)
+
+[`firefox-patch/webgpu-experimental-ray-query.patch`](firefox-patch/webgpu-experimental-ray-query.patch) applies to Firefox `main` at `9fcf3a1690ec`. It only touches Firefox's own code; the vendored wgpu crates are unchanged.
+
+```
+cd firefox
+git apply /path/to/webgpu-experimental-ray-query.patch
+./mach build
+./mach run --setpref dom.webgpu.experimental-ray-query.enabled=true
+```
+
+With the pref off (the default) Firefox behaves as before: the API below is not exposed and the feature is never offered.
+
+### JavaScript API (prototype)
+
+```js
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter.features.has('experimental-ray-query')) { /* fall back to a compute-shader tracer */ }
+const device = await adapter.requestDevice({ requiredFeatures: ['experimental-ray-query'] });
+
+const vertexBuffer = device.createBuffer({ size, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.BLAS_INPUT });
+const blas = device.createBlas({ geometries: [{ vertexFormat: 'float32x3', vertexCount: 3 }] }); // optional indexFormat, indexCount, opaque
+const tlas = device.createTlas({ maxInstances: 1 });
+
+const encoder = device.createCommandEncoder();
+encoder.buildAccelerationStructures(
+  [{ blas, geometries: [{ vertexBuffer, vertexStride: 12 }] }],     // optional firstVertex, indexBuffer, firstIndex
+  [{ tlas, instances: [{ blas, customData: 7 }] }],                   // optional transform (12 numbers, row-major 3x4), mask
+);
+// Bind group layout entry: { binding, visibility, accelerationStructure: {} }; bind group entry: { binding, resource: tlas }
+```
+
+WGSL uses wgpu's extension: `enable wgpu_ray_query;`, `var acc: acceleration_structure;`, `ray_query`, `rayQueryInitialize`, `rayQueryProceed`, `rayQueryGetCommittedIntersection`. The names (`GPUBlas`, `GPUTlas`, `BLAS_INPUT`) follow wgpu, not any WebGPU proposal.
+
+### How it works
+
+- **Pref** `dom.webgpu.experimental-ray-query.enabled` (read once at startup).
+- **GPU process** (`gfx/wgpu_bindings/src/server.rs`): with the pref on, wgpu's instance is created without `STRICT_WEBGPU_COMPLIANCE`, which otherwise hides the feature and zeroes the acceleration structure limits. A device that asks for the feature is created directly with wgpu-core (Firefox's wrapper always disables experimental features), with `ExperimentalFeatures::enabled()` and the adapter's acceleration structure limits. BLAS/TLAS objects live in tables next to wgpu's own, and bind groups and builds that use them are assembled from wgpu-core's public API.
+- **IPC** (`lib.rs`, `client.rs`): new messages to create, build, bind and drop acceleration structures; adapters report whether ray queries are on offer.
+- **DOM** (`dom/webidl/WebGPU.webidl`, `dom/webgpu/`): the API above. `GPUBufferUsage.BLAS_INPUT` (0x40000000, a bit WebGPU doesn't use) becomes wgpu's native `BufferUsages::BLAS_INPUT`, which BLAS build inputs need.
+
+### Verified
+
+On the RTX 5070 (Windows 11, DX12), with [`pages/rayquery-smoke.html`](pages/rayquery-smoke.html) (the Phase 0 scene, written against the JS API):
+
+- Pref on: the adapter offers `experimental-ray-query`, and the page builds a BLAS and a TLAS, then traces 256 rays in a compute shader. 50 hits, identical to the CPU trace (0 mismatches, max hit-distance error 0) and to the native Phase 0 run. The GPU process loaded `d3d12.dll` and `dxcompiler.dll`, not Vulkan.
+- Pref on: the plain [`webgpu-check.html`](pages/webgpu-check.html) still passes; the feature list gains only `experimental-ray-query`.
+- Pref off: the check passes, the feature is absent, and `createBlas`/`buildAccelerationStructures` are undefined.
+- Incremental rebuilds after the patch took about 7 minutes.
+
+### Not done or not checked
+
+- Triangle geometry only: no AABBs, transform buffers, BLAS/TLAS updates or compaction, vertex return, or `destroy()` (objects are freed when garbage-collected). Build flags are fixed (`PREFER_FAST_TRACE`, full rebuild).
+- A build whose geometry count differs from the BLAS's throws a `TypeError` instead of a WebGPU validation error. An unknown BLAS/TLAS in a build is only logged in the GPU process.
+- Turning the pref on drops strict WebGPU compliance for every page, not just ones using ray queries. Known effects: an adapter can create more than one device, and wgpu's extra `max_buffers_and_acceleration_structures_per_shader_stage` limit (28 by default) applies.
+- Not hardened. wgpu marks ray queries as experimental, and this exposes them to web content. Keep the pref off for normal browsing.
+- Not tested: the Vulkan backend (basic WebGPU already fails there, see Phase 1), Linux, macOS, workers, Firefox's own test suites or the WebGPU CTS, and performance. Rust changes were not run through rustfmt.
 
 ## wgpu-rq-test
 
