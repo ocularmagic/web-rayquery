@@ -9,7 +9,7 @@ Background: [gpuweb#535](https://github.com/gpuweb/gpuweb/issues/535) (ray traci
 | Phase | What | State |
 |---|---|---|
 | 0 | Check wgpu/Firefox support; run wgpu ray queries natively | Done |
-| 1 | Build Firefox unmodified | Not started |
+| 1 | Build Firefox unmodified | Done |
 | 2 | Pref-gated ray query API in Firefox (WebIDL, dom/webgpu, IPC, wgpu_bindings) | Not started |
 | 3 | Test page (plain WebGPU) tracing rays vs a software result | Not started |
 | 4 | Write-up | Maybe |
@@ -24,6 +24,14 @@ Background: [gpuweb#535](https://github.com/gpuweb/gpuweb/issues/535) (ray traci
   - Device creation only passes WebGPU features and disables experimental features.
   - The content-to-GPU-process layer (`wgpu-core-remote`) has no create/build commands for acceleration structures, and its bind group layouts can't hold one.
   - No WebIDL for any of it.
+
+## Phase 1 findings (October 2026)
+
+- Full (non-artifact) build of Firefox `main` at `9fcf3a1690ec` (Firefox 161 Nightly) on Windows 11 with MozillaBuild 4.2.1, following the [Windows build docs](https://firefox-source-docs.mozilla.org/setup/windows_build.html). `./mach build` took 29 min on a 20-core desktop CPU, no errors.
+- Bootstrap fetched Mozilla's own clang-cl, MSVC/SDK package and `dxcompiler.dll`; configure found DXC, so WebGPU is enabled.
+- [`pages/webgpu-check.html`](pages/webgpu-check.html) (adapter, features, compute round trip) passes in the build. The GPU process loads `d3d12.dll` + `dxcompiler.dll` and no `vulkan-1.dll`: WebGPU runs on **DX12** by default. `adapter.info` fields are blank (Firefox hides them).
+- `--setpref dom.webgpu.wgpu-backend=vulkan` does switch wgpu to Vulkan (wgpu logs `backend: Vulkan`), but the same check then fails ("Buffer unmapped") and the log shows GPU-process `AbnormalShutdown` messages. Not investigated; DX12 is the path for this prototype.
+- Notes: mach limits its terminal output when it detects an AI agent (full log in `obj-*/.mozbuild/logs/build/`). Firefox prints page `console.log` to stdout with `--setpref devtools.console.stdout.content=true`, and honours `RUST_LOG` for wgpu logs.
 
 ## wgpu-rq-test
 
