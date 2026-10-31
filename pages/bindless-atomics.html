@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Bindless and texture atomics test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>Bindless and texture atomics test</h1>
+<p>Binding arrays: 8 textures in one <code>binding_array</code>, each thread picking its own (non-uniform index).
+64-bit texture atomics: <code>textureAtomicMax</code> on an <code>r64uint</code> storage texture, the operation a
+visibility-buffer (Nanite-style) rasterizer is built on. Results are also printed as <code>BINDLESS ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("BINDLESS " + line); };
+
+async function readBuffer(device, buffer, size) {
+  const readback = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer, 0, readback, 0, size);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const words = new Uint32Array(readback.getMappedRange().slice(0));
+  readback.unmap();
+  return words;
+}
+
+async function bindless(device) {
+  const COUNT = 8;
+  const textures = [];
+  for (let i = 0; i < COUNT; i++) {
+    const texture = device.createTexture({ size: [1, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture }, new Uint8Array([i * 10, i * 20, 255 - i, 255]), { bytesPerRow: 4 }, [1, 1]);
+    textures.push(texture.createView());
+  }
+  const output = device.createBuffer({ size: COUNT * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: "float" }, count: COUNT },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+  ] });
+  const module = device.createShaderModule({ code: `
+enable wgpu_binding_array;
+@group(0) @binding(0) var textures: binding_array<texture_2d<f32>, ${COUNT}>;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(${COUNT}) fn main(@builtin(local_invocation_index) i: u32) {
+  let c = textureLoad(textures[i], vec2<i32>(0, 0), 0);
+  out[i] = pack4x8unorm(c);
+}` });
+  const info = await module.getCompilationInfo();
+  for (const m of info.messages) log(`bindless shader ${m.type}: ${m.message}`);
+  const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module, entryPoint: "main" } });
+  const group = device.createBindGroup({ layout, entries: [{ binding: 0, resource: textures }, { binding: 1, resource: { buffer: output } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, group);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  const words = await readBuffer(device, output, COUNT * 4);
+  let bad = 0;
+  for (let i = 0; i < COUNT; i++) {
+    const expected = ((255 << 24) | ((255 - i) << 16) | ((i * 20) << 8) | (i * 10)) >>> 0;
+    if (words[i] !== expected) bad++;
+  }
+  log(`binding array ${bad === 0 ? "PASS" : "FAIL"}: ${COUNT - bad} of ${COUNT} threads read their own texture`);
+}
+
+async function textureAtomics(device) {
+  const SIZE = 4;
+  const target = device.createTexture({ size: [SIZE, SIZE], format: "r64uint", usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC });
+  const output = device.createBuffer({ size: SIZE * 256, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "atomic", format: "r64uint" } },
+  ] });
+  // Each of 64 threads writes (depth << 32 | id) to every texel; the max must win: thread 63's value.
+  const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var ids: texture_storage_2d<r64uint, atomic>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32) {
+  for (var y = 0; y < ${SIZE}; y++) {
+    for (var x = 0; x < ${SIZE}; x++) {
+      textureAtomicMax(ids, vec2<i32>(x, y), (u64(i) << 32u) | u64(1000u + i));
+    }
+  }
+}` });
+  const info = await module.getCompilationInfo();
+  for (const m of info.messages) log(`atomics shader ${m.type}: ${m.message}`);
+  device.pushErrorScope("validation");
+  const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module, entryPoint: "main" } });
+  const group = device.createBindGroup({ layout, entries: [{ binding: 0, resource: target.createView() }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, group);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  encoder.copyTextureToBuffer({ texture: target }, { buffer: output, bytesPerRow: 256 }, [SIZE, SIZE]);
+  device.queue.submit([encoder.finish()]);
+  const error = await device.popErrorScope();
+  if (error) { log(`texture atomics FAIL: ${error.message}`); return; }
+  const words = await readBuffer(device, output, SIZE * 256);
+  let good = 0;
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const low = words[(y * 256 + x * 8) / 4], high = words[(y * 256 + x * 8) / 4 + 1];
+      if (low === 1063 && high === 63) good++;
+    }
+  }
+  log(`64-bit texture atomics ${good === SIZE * SIZE ? "PASS" : "FAIL"}: ${good} of ${SIZE * SIZE} texels hold the largest value (high 63, low 1063)`);
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const wanted = ["wgpu-texture-binding-array", "wgpu-sampled-texture-and-storage-buffer-array-non-uniform-indexing", "wgpu-texture-atomic", "wgpu-texture-int64-atomic", "wgpu-shader-int64"];
+  const offered = wanted.filter((f) => adapter.features.has(f));
+  log(`offered: ${offered.join(", ") || "none"}`);
+  const device = await adapter.requestDevice({ requiredFeatures: offered });
+  device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+  if (device.features.has("wgpu-texture-binding-array")) await bindless(device); else log("binding array SKIP");
+  if (device.features.has("wgpu-texture-int64-atomic")) await textureAtomics(device); else log("texture atomics SKIP");
+  log("DONE");
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>

@@ -1,0 +1,134 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Cooperative matrix test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>Cooperative matrix test</h1>
+<p>Feature <code>wgpu-cooperative-matrix</code>: one subgroup multiplies matrices on the tensor cores with WGSL
+<code>coopMultiplyAdd</code>, <code>C = A·B + C</code>, accumulating in <code>f32</code>. Element types: <code>f16</code>
+(16×16×16), and on Vulkan with <code>VK_KHR_shader_bfloat16</code> / <code>VK_EXT_shader_float8</code> the prototype's
+<code>bf16</code> (16×16×16) and <code>f8e4m3</code> / <code>f8e5m2</code> (16×16×32). The bf16 and float8 matrices are
+loaded from <code>u32</code> arrays (the bits are reinterpreted). Small integers keep every product exact, so the results
+must equal the CPU's. Results are also printed as <code>COOPMAT ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("COOPMAT " + line); };
+
+const random = (seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff)(11);
+const int = (lo, hi) => lo + Math.floor(random() * (hi - lo + 1));
+
+// Bit patterns of small integers (-2..2) in each element type.
+function f16(v) {
+  if (v === 0) return 0;
+  const sign = v < 0 ? 0x8000 : 0;
+  let x = Math.abs(v), e = 15;
+  while (x >= 2) { x /= 2; e++; }
+  while (x < 1) { x *= 2; e--; }
+  return sign | (e << 10) | Math.round((x - 1) * 1024);
+}
+const bf16 = (v) => (new Uint32Array(new Float32Array([v]).buffer)[0] >>> 16);
+function f8(v, exponentBits) {
+  if (v === 0) return 0;
+  const mantissaBits = 7 - exponentBits, bias = (1 << (exponentBits - 1)) - 1;
+  const sign = v < 0 ? 0x80 : 0;
+  let x = Math.abs(v), e = bias;
+  while (x >= 2) { x /= 2; e++; }
+  while (x < 1) { x *= 2; e--; }
+  return sign | (e << mantissaBits) | Math.round((x - 1) * (1 << mantissaBits));
+}
+
+// Packs element bit patterns (bits wide each) into u32s, little-endian.
+function pack(bits, values) {
+  const perWord = 32 / bits, words = new Uint32Array(Math.ceil(values.length / perWord));
+  values.forEach((v, i) => { words[Math.floor(i / perWord)] |= v << ((i % perWord) * bits); });
+  return words;
+}
+
+const M = 16, N = 16;
+const TESTS = [
+  { name: "f16", feature: "shader-f16", k: 16, wgsl: "f16", bits: 16, encode: f16, enable: "enable f16;" },
+  { name: "bf16", k: 16, wgsl: "bf16", bits: 16, encode: bf16 },
+  { name: "f8e4m3", k: 32, wgsl: "f8e4m3", bits: 8, encode: (v) => f8(v, 4) },
+  { name: "f8e5m2", k: 32, wgsl: "f8e5m2", bits: 8, encode: (v) => f8(v, 5) },
+];
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter.features.has("wgpu-cooperative-matrix")) {
+    log("wgpu-cooperative-matrix SKIP (not offered)");
+    log("DONE");
+  } else {
+    const wanted = ["wgpu-cooperative-matrix", ...(adapter.features.has("shader-f16") ? ["shader-f16"] : [])];
+    const device = await adapter.requestDevice({ requiredFeatures: wanted });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+    for (const test of TESTS) {
+      if (test.feature && !wanted.includes(test.feature)) { log(`${test.name} SKIP (no ${test.feature})`); continue; }
+      const K = test.k;
+      const A = Array.from({ length: M * K }, () => int(-2, 2));   // M rows of K, row-major
+      const B = Array.from({ length: K * N }, () => int(-2, 2));   // K rows of N, row-major
+      const C0 = Array.from({ length: M * N }, () => int(-4, 4));
+      const upload = (words, usage = GPUBufferUsage.STORAGE) => {
+        const buffer = device.createBuffer({ size: Math.max(16, words.byteLength), usage: usage | GPUBufferUsage.COPY_DST });
+        device.queue.writeBuffer(buffer, 0, words);
+        return buffer;
+      };
+      const a = upload(pack(test.bits, A.map(test.encode)));
+      const b = upload(pack(test.bits, B.map(test.encode)));
+      const c = upload(new Float32Array(C0), GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+      const readback = device.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const perWord = 32 / test.bits;
+      // coop_mat{columns}x{rows}; row-major loads, strides counted in u32s.
+      const shader = `
+${test.enable ?? ""}
+enable wgpu_cooperative_matrix;
+@group(0) @binding(0) var<storage, read> a: array<u32>;
+@group(0) @binding(1) var<storage, read> b: array<u32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@compute @workgroup_size(32)
+fn main() {
+  let ma = coopLoadT<coop_mat${K}x${M}<${test.wgsl}, A>>(&a[0], ${K / perWord}u);
+  let mb = coopLoadT<coop_mat${N}x${K}<${test.wgsl}, B>>(&b[0], ${N / perWord}u);
+  var mc = coopLoadT<coop_mat${N}x${M}<f32, C>>(&c[0]);
+  mc = coopMultiplyAdd(ma, mb, mc);
+  coopStoreT(mc, &c[0]);
+}`;
+      device.pushErrorScope("validation");
+      const module = device.createShaderModule({ code: shader });
+      const messages = (await module.getCompilationInfo()).messages;
+      for (const m of messages) log(`${test.name} shader ${m.type}: ${m.message}`);
+      const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: a } }, { binding: 1, resource: { buffer: b } }, { binding: 2, resource: { buffer: c } }] });
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, group);
+      pass.dispatchWorkgroups(1);
+      pass.end();
+      encoder.copyBufferToBuffer(c, 0, readback, 0, M * N * 4);
+      device.queue.submit([encoder.finish()]);
+      const error = await device.popErrorScope();
+      if (error) log(`${test.name} validation error: ${error.message}`);
+      await readback.mapAsync(GPUMapMode.READ);
+      const got = new Float32Array(readback.getMappedRange().slice(0));
+      readback.unmap();
+      let wrong = 0, first = "";
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < N; n++) {
+          let want = C0[m * N + n];
+          for (let k = 0; k < K; k++) want += A[m * K + k] * B[k * N + n];
+          if (got[m * N + n] !== want) {
+            wrong++;
+            if (!first) first = ` (first at ${m},${n}: got ${got[m * N + n]}, want ${want})`;
+          }
+        }
+      }
+      log(`${test.name} ${M}x${N}x${K} ${wrong === 0 && !error ? "PASS" : "FAIL"} ${M * N - wrong}/${M * N} outputs equal the CPU's${first}`);
+    }
+    log("DONE");
+  }
+} catch (e) {
+  log(`ERROR ${e?.message ?? e}`);
+  log("DONE");
+}
+</script>

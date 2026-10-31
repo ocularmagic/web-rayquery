@@ -1,0 +1,143 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>wgpu native features</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>wgpu native features</h1>
+<p>Requests a device with every feature the adapter offers, then runs a small shader for each new one.
+Results are also printed to the console as <code>NATIVE ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("NATIVE " + line); };
+
+// Compute tests: the shader writes u32s (or f32s) to binding 0, which are compared with `expect`.
+const computeTests = [
+  {
+    feature: "subgroups", words: 64, check: (w) => w[0] === w[63] && w[0] % 1000 === Math.floor(w[0] / 1000),
+    describe: (w) => `subgroupAdd(1) and subgroup_size both ${w[0] % 1000}`,
+    // wgpu's compiler has subgroup operations without \`enable subgroups;\` (it rejects the directive for now).
+    code: `@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32, @builtin(subgroup_size) size: u32) {
+  out[i] = subgroupAdd(1u) * 1000u + size;
+}`,
+  },
+  {
+    feature: "wgpu-shader-int64", words: 2, check: (w) => w[0] === 5 && w[1] === 768,
+    describe: (w) => `3 * 2^40 + 5 = high ${w[1]}, low ${w[0]}`,
+    code: `@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(1) fn main() {
+  let b = 1099511627776lu * 3lu + 5lu;
+  out[0] = u32(b & 0xFFFFFFFFlu);
+  out[1] = u32(b >> 32u);
+}`,
+  },
+  {
+    feature: "wgpu-shader-int64-atomic-min-max", words: 2, check: (w) => w[0] === 7 && w[1] === 126,
+    describe: (w) => `atomicMax over 64 threads = high ${w[1]}, low ${w[0]}`,
+    code: `@group(0) @binding(0) var<storage, read_write> m: atomic<u64>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32) {
+  atomicMax(&m, (u64(i) << 33u) | 7lu);
+}`,
+  },
+  {
+    feature: "wgpu-shader-i16", words: 1, check: (w) => w[0] === 6,
+    describe: (w) => `i16(3) * 2 = ${w[0]}`,
+    code: `enable wgpu_int16;
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(1) fn main() {
+  let x: i16 = i16(3);
+  out[0] = u32(i32(x * i16(2)));
+}`,
+  },
+  {
+    feature: "wgpu-shader-f64", words: 2, floats: true, check: (w) => Math.abs(w[1] - 1 / 3) < 1e-7,
+    describe: (w) => `1/3 in f64 = ${w[1]}`,
+    code: `@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1) fn main() {
+  let x: f64 = 1.0lf / 3.0lf;
+  out[0] = f32(x * 3.0lf - 1.0lf);
+  out[1] = f32(x);
+}`,
+  },
+  {
+    feature: "wgpu-shader-float32-atomic", words: 1, floats: true, check: (w) => w[0] === 32,
+    describe: (w) => `atomicAdd(0.5) over 64 threads = ${w[0]}`,
+    code: `@group(0) @binding(0) var<storage, read_write> s: atomic<f32>;
+@compute @workgroup_size(64) fn main() {
+  atomicAdd(&s, 0.5);
+}`,
+  },
+];
+
+// Compile-only tests: the shader module must compile with no errors.
+const compileTests = [
+  { feature: "primitive-index", code: `enable primitive_index;
+@fragment fn fs(@builtin(primitive_index) p: u32) -> @location(0) vec4f { return vec4f(f32(p)); }` },
+  { feature: "wgpu-shader-barycentrics", code: `@fragment fn fs(@builtin(barycentric) b: vec3f) -> @location(0) vec4f { return vec4f(b, 1.0); }` },
+  { feature: "wgpu-shader-draw-index", code: `enable draw_index;
+@vertex fn vs(@builtin(draw_index) d: u32) -> @builtin(position) vec4f { return vec4f(f32(d)); }` },
+  { feature: "wgpu-subgroup-barrier", code: `@compute @workgroup_size(32) fn main() { subgroupBarrier(); }` },
+  { feature: "wgpu-subgroup-vertex", code: `@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(f32(subgroupAdd(i))); }` },
+  { feature: "wgpu-shader-early-depth-test", code: `@fragment @early_depth_test(force) fn fs() -> @location(0) vec4f { return vec4f(1.0); }` },
+  { feature: "wgpu-vertex-writable-storage", code: `@group(0) @binding(0) var<storage, read_write> s: array<u32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { s[i] = i; return vec4f(0.0); }` },
+];
+
+async function compileErrors(device, code) {
+  device.pushErrorScope("validation");
+  const module = device.createShaderModule({ code });
+  const info = await module.getCompilationInfo();
+  const scope = await device.popErrorScope();
+  const messages = info.messages.filter((m) => m.type === "error").map((m) => m.message);
+  if (scope) messages.push(scope.message);
+  return { module, messages };
+}
+
+async function runCompute(device, test) {
+  const { module, messages } = await compileErrors(device, test.code);
+  if (messages.length) return { ok: false, detail: messages.join(" | ").slice(0, 400) };
+  device.pushErrorScope("validation");
+  const size = Math.max(16, test.words * 4);
+  const storage = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const readback = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+  const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: storage } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, group);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  encoder.copyBufferToBuffer(storage, 0, readback, 0, size);
+  device.queue.submit([encoder.finish()]);
+  const error = await device.popErrorScope();
+  if (error) return { ok: false, detail: error.message.slice(0, 400) };
+  await readback.mapAsync(GPUMapMode.READ);
+  const words = Array.from(test.floats ? new Float32Array(readback.getMappedRange()) : new Uint32Array(readback.getMappedRange()));
+  readback.unmap();
+  return { ok: test.check(words), detail: test.describe(words) };
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const features = [...adapter.features].sort();
+  log(`adapter features (${features.length}): ${features.join(", ")}`);
+  log(`subgroup sizes: ${adapter.info.subgroupMinSize}..${adapter.info.subgroupMaxSize}`);
+  const device = await adapter.requestDevice({ requiredFeatures: features });
+  log(`device created with ${device.features.size} features`);
+  for (const test of computeTests) {
+    if (!device.features.has(test.feature)) { log(`${test.feature} SKIP (not offered)`); continue; }
+    const result = await runCompute(device, test);
+    log(`${test.feature} ${result.ok ? "PASS" : "FAIL"} ${result.detail}`);
+  }
+  for (const test of compileTests) {
+    if (!device.features.has(test.feature)) { log(`${test.feature} SKIP (not offered)`); continue; }
+    const { messages } = await compileErrors(device, test.code);
+    log(`${test.feature} ${messages.length ? "FAIL " + messages.join(" | ").slice(0, 400) : "PASS compiles"}`);
+  }
+  log("DONE");
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>

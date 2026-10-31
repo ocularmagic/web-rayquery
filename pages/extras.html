@@ -1,0 +1,202 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>wgpu extras test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>wgpu extras test</h1>
+<p>Wireframe, conservative rasterization, 16-bit normalized formats, texture swizzle, border colours, clear-texture,
+timestamps inside encoders and passes, and pipeline statistics. Results are also printed as <code>EXTRA ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("EXTRA " + line); };
+const SIZE = 32;
+let device;
+
+async function read(buffer, size) {
+  const readback = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer, 0, readback, 0, size);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const copy = readback.getMappedRange().slice(0);
+  readback.unmap();
+  return copy;
+}
+
+async function readTexture(texture, bytesPerPixel = 4) {
+  const buffer = device.createBuffer({ size: 256 * SIZE, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const encoder = device.createCommandEncoder();
+  encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [SIZE, SIZE]);
+  device.queue.submit([encoder.finish()]);
+  const bytes = new Uint8Array(await read(buffer, 256 * SIZE));
+  return (x, y) => bytes.slice(y * 256 + x * bytesPerPixel, y * 256 + (x + 1) * bytesPerPixel);
+}
+
+function renderTarget(format = "rgba8unorm") {
+  return device.createTexture({ size: [SIZE, SIZE], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC | GPUTextureUsage.TEXTURE_BINDING });
+}
+
+async function drawTriangle(code, primitive, format = "rgba8unorm") {
+  const module = device.createShaderModule({ code });
+  const pipeline = device.createRenderPipeline({ layout: "auto", vertex: { module, entryPoint: "vs" }, fragment: { module, entryPoint: "fs", targets: [{ format }] }, primitive });
+  const texture = renderTarget(format);
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] }] });
+  pass.setPipeline(pipeline);
+  pass.draw(3);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return texture;
+}
+
+const tests = {
+  async "wgpu-polygon-mode-line"() {
+    const code = `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-0.8, -0.8), vec2f(0.8, -0.8), vec2f(0.0, 0.8));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(1.0); }`;
+    const at = await readTexture(await drawTriangle(code, { polygonMode: "line" }));
+    const centre = at(16, 18)[0], edge = at(16, 3)[0] + at(16, 2)[0] + at(16, 4)[0];
+    return [centre === 0 && edge > 0, `centre ${centre}, bottom edge ${edge > 0 ? "drawn" : "empty"}`];
+  },
+  async "wgpu-conservative-rasterization"() {
+    // A sliver between pixel centres: covers no centre, so it only draws with conservative rasterization.
+    const code = `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-0.5, 0.01), vec2f(0.5, 0.01), vec2f(0.0, 0.03));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(1.0); }`;
+    let normal = 0, conservative = 0;
+    const atNormal = await readTexture(await drawTriangle(code, {}));
+    const atConservative = await readTexture(await drawTriangle(code, { conservative: true }));
+    for (let y = 0; y < SIZE; y++) for (let x = 0; x < SIZE; x++) { normal += atNormal(x, y)[0] > 0; conservative += atConservative(x, y)[0] > 0; }
+    return [normal === 0 && conservative > 0, `pixels drawn: normal ${normal}, conservative ${conservative}`];
+  },
+  async "wgpu-texture-format-16-bit-norm"() {
+    const code = `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0.5, 0.25, 1.0, 1.0); }`;
+    const texture = await drawTriangle(code, {}, "rgba16unorm");
+    const at = await readTexture(texture, 8);
+    const v = new Uint16Array(at(5, 5).buffer);
+    return [Math.abs(v[0] - 32768) <= 1 && Math.abs(v[1] - 16384) <= 1 && v[2] === 65535, `rgba16unorm pixel ${Array.from(v).join(",")}`];
+  },
+  async "texture-component-swizzle"() {
+    const texture = device.createTexture({ size: [1, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture }, new Uint8Array([255, 128, 0, 255]), { bytesPerRow: 4 }, [1, 1]);
+    const output = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> o: array<f32>;
+@compute @workgroup_size(1) fn main() { let c = textureLoad(t, vec2i(0), 0); o[0] = c.r; o[1] = c.g; o[2] = c.b; o[3] = c.a; }` });
+    const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: texture.createView({ swizzle: "bgr1" }) }, { binding: 1, resource: { buffer: output } }] });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(1); pass.end();
+    device.queue.submit([encoder.finish()]);
+    const v = Array.from(new Float32Array(await read(output, 16))).map((x) => +x.toFixed(2));
+    return [v[0] === 0 && v[1] === 0.5 && v[2] === 1 && v[3] === 1, `view "bgr1" of (1, 0.5, 0, 1) reads ${v.join(", ")}`];
+  },
+  async "wgpu-address-mode-clamp-to-border"() {
+    const texture = device.createTexture({ size: [1, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    device.queue.writeTexture({ texture }, new Uint8Array([255, 0, 0, 255]), { bytesPerRow: 4 }, [1, 1]);
+    const sampler = device.createSampler({ addressModeU: "clamp-to-border", addressModeV: "clamp-to-border", borderColor: "opaque-white" });
+    const output = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+@group(0) @binding(2) var<storage, read_write> o: array<vec4f>;
+@compute @workgroup_size(1) fn main() { o[0] = textureSampleLevel(t, s, vec2f(0.5), 0.0); o[1] = textureSampleLevel(t, s, vec2f(5.0), 0.0); }` });
+    const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: texture.createView() }, { binding: 1, resource: sampler }, { binding: 2, resource: { buffer: output } }] });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(1); pass.end();
+    device.queue.submit([encoder.finish()]);
+    const v = Array.from(new Float32Array(await read(output, 32))).map((x) => +x.toFixed(2));
+    return [v.slice(0, 4).join() === "1,0,0,1" && v.slice(4).join() === "1,1,1,1", `inside ${v.slice(0, 4).join(",")}, outside ${v.slice(4).join(",")} (border opaque white)`];
+  },
+  async "wgpu-clear-texture"() {
+    const texture = device.createTexture({ size: [SIZE, SIZE], format: "rgba8unorm", usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC });
+    device.queue.writeTexture({ texture }, new Uint8Array(SIZE * SIZE * 4).fill(200), { bytesPerRow: SIZE * 4 }, [SIZE, SIZE]);
+    const encoder = device.createCommandEncoder();
+    encoder.clearTexture(texture);
+    device.queue.submit([encoder.finish()]);
+    const at = await readTexture(texture);
+    return [at(7, 9).join() === "0,0,0,0", `after clearTexture: ${at(7, 9).join(",")} (was 200s)`];
+  },
+  async "wgpu-timestamp-query-inside-passes"() {
+    const querySet = device.createQuerySet({ type: "timestamp", count: 4 });
+    const resolved = device.createBuffer({ size: 32, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const module = device.createShaderModule({ code: `@group(0) @binding(0) var<storage, read_write> o: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) { var v = f32(id.x); for (var k = 0; k < 2000; k++) { v = sin(v) * 1.01; } o[id.x] = v; }` });
+    const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    const buffer = device.createBuffer({ size: 4 * 64 * 256, usage: GPUBufferUsage.STORAGE });
+    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer } }] });
+    const encoder = device.createCommandEncoder();
+    encoder.writeTimestamp(querySet, 0);
+    const pass = encoder.beginComputePass();
+    pass.writeTimestamp(querySet, 1);
+    pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(256);
+    pass.writeTimestamp(querySet, 2);
+    pass.end();
+    encoder.writeTimestamp(querySet, 3);
+    encoder.resolveQuerySet(querySet, 0, 4, resolved, 0);
+    device.queue.submit([encoder.finish()]);
+    const t = Array.from(new BigUint64Array(await read(resolved, 32)));
+    const ok = t[0] > 0n && t[0] <= t[1] && t[1] < t[2] && t[2] <= t[3];
+    return [ok, `encoder ${t[0]} -> pass start +${t[1] - t[0]} ns -> pass end +${t[2] - t[0]} ns -> encoder +${t[3] - t[0]} ns`];
+  },
+  async "wgpu-pipeline-statistics-query"() {
+    const querySet = device.createQuerySet({ type: "pipeline-statistics", count: 1, pipelineStatistics: ["compute-shader-invocations"] });
+    const resolved = device.createBuffer({ size: 256, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    const module = device.createShaderModule({ code: `@group(0) @binding(0) var<storage, read_write> o: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) { o[id.x] = id.x; }` });
+    const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    const buffer = device.createBuffer({ size: 4 * 64 * 10, usage: GPUBufferUsage.STORAGE });
+    const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer } }] });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.beginPipelineStatisticsQuery(querySet, 0);
+    pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(10);
+    pass.endPipelineStatisticsQuery();
+    pass.end();
+    encoder.resolveQuerySet(querySet, 0, 1, resolved, 0);
+    device.queue.submit([encoder.finish()]);
+    const count = new BigUint64Array(await read(resolved, 8))[0];
+    return [count === 640n, `compute shader invocations: ${count} (expected 640)`];
+  },
+};
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const wanted = Object.keys(tests).concat(["timestamp-query", "wgpu-polygon-mode-point", "wgpu-timestamp-query-inside-encoders", "wgpu-address-mode-clamp-to-zero", "wgpu-cooperative-matrix", "wgpu-multisample-array", "wgpu-texture-adapter-specific-format-features"]);
+  const offered = wanted.filter((f) => adapter.features.has(f));
+  log(`adapter features: ${adapter.features.size}; asked for ${offered.length} of ${wanted.length}: missing ${wanted.filter((f) => !offered.includes(f)).join(", ") || "none"}`);
+  device = await adapter.requestDevice({ requiredFeatures: offered });
+  device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message.slice(0, 300)}`));
+  for (const [name, test] of Object.entries(tests)) {
+    if (!device.features.has(name)) { log(`${name} SKIP (not offered)`); continue; }
+    device.pushErrorScope("validation");
+    try {
+      const [ok, detail] = await test();
+      const error = await device.popErrorScope();
+      log(`${name} ${error ? "FAIL " + error.message.slice(0, 300) : ok ? "PASS" : "FAIL"} ${detail}`);
+    } catch (e) {
+      await device.popErrorScope();
+      log(`${name} FAIL ${e.message}`);
+    }
+  }
+  log("DONE");
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>

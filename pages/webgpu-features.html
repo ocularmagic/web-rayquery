@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU features</title>
+<pre id="out">Checking…</pre>
+<script type="module">
+// Lists every WebGPU feature and limit this browser gives web pages (also printed to the console).
+const out = document.getElementById("out");
+const lines = [];
+if (!navigator.gpu) {
+  lines.push("No WebGPU in this browser.");
+} else {
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) {
+    lines.push("No WebGPU adapter.");
+  } else {
+    const info = adapter.info ?? {};
+    lines.push(`Adapter: ${info.vendor ?? "?"} ${info.architecture ?? ""} ${info.description ?? ""}`.trim());
+    lines.push(`Features (${adapter.features.size}): ${[...adapter.features].sort().join(" ")}`);
+    const limits = [];
+    for (const key in adapter.limits) limits.push(`${key}=${adapter.limits[key]}`);
+    lines.push(`Limits: ${limits.sort().join(" ")}`);
+  }
+}
+out.textContent = lines.join("\n");
+for (const line of lines) console.log("[webgpu-features] " + line);
+</script>

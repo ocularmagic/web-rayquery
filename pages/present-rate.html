@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Presentation rate test</title>
+<style>html, body { margin: 0; height: 100%; background: #000; } canvas { width: 100vw; height: 100vh; display: block; }</style>
+<canvas id="view"></canvas>
+<script type="module">
+// Clears a full-window canvas to a cycling colour every frame and reports frames per second, so presentation cost can
+// be told apart from rendering cost. Prints PRESENT lines to the console.
+const log = (line) => console.log("PRESENT " + line);
+const canvas = document.getElementById("view");
+canvas.width = Math.round(canvas.clientWidth * devicePixelRatio);
+canvas.height = Math.round(canvas.clientHeight * devicePixelRatio);
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+const context = canvas.getContext("webgpu");
+const format = navigator.gpu.getPreferredCanvasFormat();
+context.configure({ device, format, alphaMode: "opaque" });
+let frames = 0, start = 0;
+function frame(now) {
+  if (!start) start = now;
+  const t = (now - start) / 1000;
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store",
+    clearValue: [0.5 + 0.5 * Math.sin(t * 3), 0.2, 0.8, 1] }] });
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  frames++;
+  if (now - start > 4000) {
+    log(`${canvas.width}x${canvas.height}: ${(frames / ((now - start) / 1000)).toFixed(1)} fps over ${frames} frames`);
+    log("DONE");
+    return;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>

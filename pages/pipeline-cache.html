@@ -1,0 +1,176 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pipeline cache test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>Pipeline cache test</h1>
+<p>Feature <code>wgpu-pipeline-cache</code> (Vulkan only): pipelines built with a <code>GPUPipelineCache</code>, the
+cache's bytes read back with <code>getData()</code>, and a new cache made from them. The timing line compares building
+the same pipelines cold, again without a cache, and again with the loaded cache. Results are also printed as
+<code>PCACHE ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("PCACHE " + line); };
+let device;
+
+async function read(buffer, size) {
+  const readback = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer, 0, readback, 0, size);
+  device.queue.submit([encoder.finish()]);
+  await readback.mapAsync(GPUMapMode.READ);
+  const copy = readback.getMappedRange().slice(0);
+  readback.unmap();
+  return copy;
+}
+
+const computeModule = () => device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read_write> o: array<u32, 64>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32) { o[i] = i * 3u + 1u; }` });
+
+async function runCompute(cache) {
+  const pipeline = device.createComputePipeline({ layout: "auto", compute: { module: computeModule(), entryPoint: "main" }, cache });
+  const output = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: output } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0, group); pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([encoder.finish()]);
+  const v = new Uint32Array(await read(output, 256));
+  return v.every((x, i) => x === i * 3 + 1);
+}
+
+async function runRender(cache) {
+  const module = device.createShaderModule({ code: `
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let p = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(p[i], 0.0, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 1.0, 1.0, 1.0); }` });
+  const pipeline = device.createRenderPipeline({ layout: "auto", vertex: { module, entryPoint: "vs" }, fragment: { module, entryPoint: "fs", targets: [{ format: "rgba8unorm" }] }, cache });
+  const texture = device.createTexture({ size: [4, 4], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+  const buffer = device.createBuffer({ size: 256 * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 0] }] });
+  pass.setPipeline(pipeline); pass.draw(3); pass.end();
+  encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [4, 4]);
+  device.queue.submit([encoder.finish()]);
+  const pixel = Array.from(new Uint8Array(await read(buffer, 256 * 4)).slice(256 + 4, 256 + 8)).join(",");
+  return [pixel === "0,255,255,255", `pixel ${pixel}`];
+}
+
+// A long shader, so the driver's compile time is measurable. The seed makes the code new on every page load,
+// so the first build can't come from the driver's own disk cache.
+const seed = Math.random().toFixed(6);
+const heavyCode = `
+override K: f32 = 1.0;
+@group(0) @binding(0) var<storage, read_write> o: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  var x = f32(id.x) * K + ${seed};
+  var y = x * 0.5;
+${Array.from({ length: 400 }, (_, i) => `  x = sin(x * ${(1 + i * 0.0007).toFixed(4)} + y) * cos(y * ${(0.9 + i * 0.0003).toFixed(4)} + K); y = fma(y, x, ${(i * 0.01).toFixed(2)});`).join("\n")}
+  o[id.x] = x + y;
+}`;
+const VARIANTS = 12;
+async function buildHeavy(cache) {
+  const module = device.createShaderModule({ code: heavyCode });
+  const start = performance.now();
+  await Promise.all(Array.from({ length: VARIANTS }, (_, i) =>
+    device.createComputePipelineAsync({ layout: "auto", compute: { module, entryPoint: "main", constants: { K: i + 1 } }, cache })));
+  return performance.now() - start;
+}
+
+const tests = [
+  ["compute pipeline with an empty cache", async () => {
+    const cache = device.createPipelineCache({ label: "empty" });
+    return [await runCompute(cache), "64 values correct"];
+  }],
+  ["render pipeline with a cache", async () => runRender(device.createPipelineCache())],
+  ["async pipeline with a cache", async () => {
+    const cache = device.createPipelineCache();
+    const pipeline = await device.createComputePipelineAsync({ layout: "auto", compute: { module: computeModule(), entryPoint: "main" }, cache });
+    return [pipeline instanceof GPUComputePipeline, "resolved"];
+  }],
+  ["getData, then a new cache from it", async () => {
+    const cache = device.createPipelineCache();
+    await runCompute(cache);
+    const data = await cache.getData();
+    if (!(data instanceof ArrayBuffer)) return [false, `getData returned ${data}`];
+    const magic = String.fromCharCode(...new Uint8Array(data, 0, 8));
+    const reloaded = device.createPipelineCache({ data: new Uint8Array(data), fallback: false });
+    const ok = await runCompute(reloaded);
+    const again = await reloaded.getData();
+    return [ok && again instanceof ArrayBuffer, `${data.byteLength} bytes, header "${magic}"; reloaded cache works, its data ${again?.byteLength} bytes`];
+  }],
+  ["foreign data with fallback", async () => {
+    const junk = crypto.getRandomValues(new Uint8Array(256));
+    const cache = device.createPipelineCache({ data: junk, fallback: true });
+    return [await runCompute(cache), "random bytes ignored, cache starts empty"];
+  }],
+  ["foreign data without fallback is an error", async () => {
+    device.pushErrorScope("validation");
+    device.createPipelineCache({ data: crypto.getRandomValues(new Uint8Array(256)), fallback: false });
+    const error = await device.popErrorScope();
+    return [!!error, error ? `error: ${error.message.slice(0, 160)}` : "no error"];
+  }],
+  ["build time: cold, again without cache, with loaded cache", async () => {
+    const first = device.createPipelineCache();
+    const cold = await buildHeavy(first);
+    const data = await first.getData();
+    const noCache = await buildHeavy(undefined);
+    const loaded = await buildHeavy(device.createPipelineCache({ data, fallback: false }));
+    return [true, `${VARIANTS} pipelines: cold ${cold.toFixed(0)} ms, again without cache ${noCache.toFixed(0)} ms, with loaded cache ${loaded.toFixed(0)} ms; cache ${data?.byteLength} bytes`];
+  }],
+];
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const wanted = ["wgpu-pipeline-cache", "wgpu-ray-tracing-pipelines"];
+  const offered = wanted.filter((f) => adapter.features.has(f));
+  log(`offered: ${offered.join(", ") || "none"}`);
+  if (!offered.includes("wgpu-pipeline-cache")) {
+    log("wgpu-pipeline-cache SKIP (not offered; Vulkan only)");
+  } else {
+    device = await adapter.requestDevice({ requiredFeatures: offered });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message.slice(0, 300)}`));
+    if (offered.includes("wgpu-ray-tracing-pipelines")) {
+      tests.push(["ray tracing pipeline with a cache", async () => {
+        const module = device.createShaderModule({ code: `
+enable wgpu_ray_tracing_pipeline;
+struct Payload { color: u32 }
+var<ray_payload> payload: Payload;
+@group(0) @binding(0) var scene: acceleration_structure;
+@group(0) @binding(1) var<storage, read_write> image: array<u32>;
+@ray_generation fn generate(@builtin(ray_invocation_id) id: vec3<u32>) {
+  payload = Payload(0u);
+  traceRay(scene, RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 100.0, vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0)), &payload);
+  image[id.x] = payload.color;
+}
+var<incoming_ray_payload> incoming: Payload;
+@miss @incoming_payload(incoming) fn missed() { incoming.color = 3u; }
+@closest_hit @incoming_payload(incoming) fn hit() { incoming.color = 1u; }` });
+        const cache = device.createPipelineCache();
+        device.createRayTracingPipeline({ layout: "auto", rayGeneration: { module, entryPoint: "generate" }, miss: { module, entryPoint: "missed" }, intersections: [{ closestHit: { module, entryPoint: "hit" } }], cache });
+        const data = await cache.getData();
+        return [data instanceof ArrayBuffer && data.byteLength > 0, `cache holds ${data?.byteLength} bytes after one ray tracing pipeline`];
+      }]);
+    }
+    for (const [name, test] of tests) {
+      device.pushErrorScope("validation");
+      try {
+        const [ok, detail] = await test();
+        const error = await device.popErrorScope();
+        const expectError = name.endsWith("is an error");
+        log(`${name}: ${error && !expectError ? "FAIL " + error.message.slice(0, 300) : ok ? "PASS" : "FAIL"} ${detail}`);
+      } catch (e) {
+        await device.popErrorScope();
+        log(`${name}: FAIL ${e.message}`);
+      }
+    }
+  }
+  log("DONE");
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>

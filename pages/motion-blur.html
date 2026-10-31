@@ -1,0 +1,161 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ray tracing motion blur test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; }
+  canvas { image-rendering: pixelated; width: 192px; height: 192px; border: 1px solid #888; margin-right: 8px; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>Ray tracing motion blur test</h1>
+<p>Feature <code>wgpu-ray-tracing-motion-blur</code> (Vulkan, NVIDIA). Two quads move from left to right between time 0
+and 1: the lower one by its TLAS instance's motion transform, the upper one by its BLAS's motion vertices.
+<code>traceRayMotion</code> traces at times 0, 0.5 and 1 (left to right), and hit shaders read
+<code>@builtin(ray_time)</code>. Results are also printed as <code>MOTION ...</code> lines.</p>
+<canvas id="t0" width="64" height="64"></canvas><canvas id="t1" width="64" height="64"></canvas><canvas id="t2" width="64" height="64"></canvas>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("MOTION " + line); };
+const SIZE = 64;
+const TIMES = [0, 0.5, 1];
+
+const shader = `
+enable wgpu_ray_tracing_pipeline;
+
+struct Payload { value: u32 }
+var<ray_payload> payload: Payload;
+
+@group(0) @binding(0) var scene: acceleration_structure;
+@group(0) @binding(1) var<storage, read_write> image: array<u32>;
+
+@ray_generation
+fn generate(@builtin(ray_invocation_id) id: vec3<u32>, @builtin(num_ray_invocations) count: vec3<u32>) {
+  let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(count.xy) * 2.0 - 1.0;
+  let ray = RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 100.0, vec3(uv.x, uv.y, 1.0), vec3(0.0, 0.0, -1.0));
+  let times = array(0.0, 0.5, 1.0);
+  for (var k = 0u; k < 3u; k++) {
+    payload = Payload(0u);
+    traceRayMotion(scene, ray, times[k], &payload);
+    image[k * count.x * count.y + id.y * count.x + id.x] = payload.value;
+  }
+}
+
+var<incoming_ray_payload> incoming: Payload;
+
+@miss @incoming_payload(incoming)
+fn missed() { incoming.value = 3u; }
+
+@closest_hit @incoming_payload(incoming)
+fn hit(@builtin(ray_time) time: f32, @builtin(instance_custom_data) which: u32) {
+  incoming.value = 1u + u32(round(time * 100.0)) + which * 1000u;
+}
+`;
+
+// Each quad is 0.5 wide, its centre moving from x = -0.5 to x = 0.5. The instance-moved one is at y -0.75..-0.25
+// (custom data 0), the vertex-moved one at y 0.25..0.75 (custom data 1).
+const near = (a, b) => Math.abs(a - b) < 0.05;
+function expected(k, i, j) {
+  const x = (i + 0.5) / SIZE * 2 - 1, y = (j + 0.5) / SIZE * 2 - 1;
+  const cx = -0.5 + TIMES[k];
+  for (const [cy, which] of [[-0.5, 0], [0.5, 1]]) {
+    if (near(Math.abs(x - cx), 0.25) || near(Math.abs(y - cy), 0.25)) return null;
+    if (Math.abs(x - cx) < 0.25 && Math.abs(y - cy) < 0.25) return 1 + Math.round(TIMES[k] * 100) + which * 1000;
+  }
+  return 3;
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const wanted = ["wgpu-ray-tracing-pipelines", "wgpu-ray-tracing-motion-blur"];
+  const missing = wanted.filter((f) => !adapter.features.has(f));
+  if (missing.length) {
+    log(`wgpu-ray-tracing-motion-blur SKIP (not offered: ${missing.join(", ")})`);
+    log("DONE");
+  } else {
+    const device = await adapter.requestDevice({ requiredFeatures: wanted });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+    device.pushErrorScope("validation");
+
+    const usage = GPUBufferUsage.BLAS_INPUT | GPUBufferUsage.COPY_DST;
+    const upload = (data) => {
+      const buffer = device.createBuffer({ size: data.byteLength, usage });
+      device.queue.writeBuffer(buffer, 0, data);
+      return buffer;
+    };
+    const quad = (cx, cy) => new Float32Array([cx - 0.25, cy - 0.25, 0, cx + 0.25, cy - 0.25, 0, cx + 0.25, cy + 0.25, 0, cx - 0.25, cy + 0.25, 0]);
+    const indexBuffer = upload(new Uint32Array([0, 1, 2, 0, 2, 3]));
+    const instanceQuad = upload(quad(0, 0));
+    const vertexStart = upload(quad(-0.5, 0.5));
+    const vertexEnd = upload(quad(0.5, 0.5));
+
+    const size = { vertexCount: 4, indexFormat: "uint32", indexCount: 6 };
+    const staticBlas = device.createBlas({ geometries: [size] });
+    const movingBlas = device.createBlas({ geometries: [size], allowMotion: true });
+    const tlas = device.createTlas({ maxInstances: 2, allowMotion: true });
+    const image = device.createBuffer({ size: 3 * SIZE * SIZE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readback = device.createBuffer({ size: 3 * SIZE * SIZE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+    const module = device.createShaderModule({ code: shader });
+    for (const m of (await module.getCompilationInfo()).messages) log(`shader ${m.type}: ${m.message}`);
+    const pipeline = device.createRayTracingPipeline({
+      layout: "auto",
+      rayGeneration: { module, entryPoint: "generate" },
+      miss: { module, entryPoint: "missed" },
+      intersections: [{ closestHit: { module, entryPoint: "hit" } }],
+    });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: tlas }, { binding: 1, resource: { buffer: image } }],
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.buildAccelerationStructures(
+      [
+        { blas: staticBlas, geometries: [{ vertexBuffer: instanceQuad, vertexStride: 12, indexBuffer }] },
+        { blas: movingBlas, geometries: [{ vertexBuffer: vertexStart, vertexStride: 12, indexBuffer, motionVertexBuffer: vertexEnd }] },
+      ],
+      [{ tlas, instances: [
+        { blas: staticBlas, customData: 0,
+          transform: [1, 0, 0, -0.5, 0, 1, 0, -0.5, 0, 0, 1, 0],
+          motionTransform: [1, 0, 0, 0.5, 0, 1, 0, -0.5, 0, 0, 1, 0] },
+        { blas: movingBlas, customData: 1 },
+      ] }]);
+    const pass = encoder.beginRayTracingPass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group);
+    pass.traceRays(SIZE, SIZE);
+    pass.end();
+    encoder.copyBufferToBuffer(image, 0, readback, 0, 3 * SIZE * SIZE * 4);
+    device.queue.submit([encoder.finish()]);
+    const error = await device.popErrorScope();
+    if (error) log(`validation error: ${error.message}`);
+
+    await readback.mapAsync(GPUMapMode.READ);
+    const pixels = new Uint32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+    let checked = 0, mismatches = 0;
+    for (let k = 0; k < 3; k++) {
+      const counts = {};
+      const ctx = document.getElementById(`t${k}`).getContext("2d");
+      const picture = ctx.createImageData(SIZE, SIZE);
+      for (let j = 0; j < SIZE; j++) {
+        for (let i = 0; i < SIZE; i++) {
+          const value = pixels[k * SIZE * SIZE + j * SIZE + i];
+          counts[value] = (counts[value] ?? 0) + 1;
+          const want = expected(k, i, j);
+          if (want !== null) { checked++; if (value !== want) mismatches++; }
+          const colour = value === 3 ? [40, 40, 60] : value >= 1000 ? [90, 150, 240] : [230, 120, 60];
+          picture.data.set([...colour, 255], ((SIZE - 1 - j) * SIZE + i) * 4);
+        }
+      }
+      ctx.putImageData(picture, 0, 0);
+      log(`time ${TIMES[k]}: ${Object.entries(counts).map(([v, n]) => `${v}:${n}`).join(" ")}`);
+    }
+    log(`${mismatches === 0 && !error ? "PASS" : "FAIL"} ${checked - mismatches}/${checked} pixels away from edges match`);
+    log("DONE");
+  }
+} catch (e) {
+  log(`ERROR ${e?.message ?? e}`);
+  log("DONE");
+}
+</script>

@@ -1,0 +1,247 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Complete ray tracing pipeline test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; }
+  canvas { image-rendering: pixelated; width: 256px; height: 256px; border: 1px solid #888; margin-right: 8px; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>Complete ray tracing pipeline test</h1>
+<p>One pipeline with two ray types (each with its own payload type, miss shader and hit groups, picked by
+<code>traceRay</code>'s shader binding table offset and miss index), an any-hit alpha test
+(<code>ignoreIntersection</code>), a procedural sphere found by an intersection shader on AABB geometry, a callable
+shader, and a TLAS instance flag (<code>FORCE_OPAQUE</code>). Left: primary rays; right: the second ray type. Results
+are also printed as <code>RTC ...</code> lines.</p>
+<canvas id="primary" width="64" height="64"></canvas><canvas id="probe" width="64" height="64"></canvas>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("RTC " + line); };
+const SIZE = 64;
+
+const shader = `
+enable wgpu_ray_tracing_pipeline;
+enable primitive_index;
+
+struct Payload { color: u32 }
+struct ProbePayload { value: u32, extra: u32 }
+struct CallData { v: u32 }
+
+var<ray_payload> payload: Payload;
+var<ray_payload> probe: ProbePayload;
+
+@group(0) @binding(0) var scene: acceleration_structure;
+@group(0) @binding(1) var<storage, read_write> image: array<u32>;
+@group(0) @binding(2) var<storage, read_write> probes: array<u32>;
+
+@ray_generation
+fn generate(@builtin(ray_invocation_id) id: vec3<u32>, @builtin(num_ray_invocations) count: vec3<u32>) {
+  let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(count.xy) * 2.0 - 1.0;
+  let ray = RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 100.0, vec3(uv.x, uv.y, 1.0), vec3(0.0, 0.0, -1.0));
+  payload = Payload(0u);
+  traceRay(scene, ray, &payload);
+  // The second ray type: hit groups 2 and 3, miss shader 1.
+  probe = ProbePayload(0u, 0u);
+  traceRay(scene, ray, &probe, 2u, 0u, 1u);
+  let i = id.y * count.x + id.x;
+  image[i] = payload.color;
+  probes[i] = probe.value + probe.extra;
+}
+
+var<incoming_ray_payload> incoming: Payload;
+var<incoming_ray_payload> incomingProbe: ProbePayload;
+
+@miss @incoming_payload(incoming)
+fn missPrimary() { incoming.color = 3u; }
+
+@miss @incoming_payload(incomingProbe)
+fn missProbe() { incomingProbe.value = 300u; incomingProbe.extra = 0u; }
+
+@closest_hit @incoming_payload(incoming)
+fn hitTri(@builtin(primitive_index) primitive: u32) { incoming.color = 1u + primitive * 16u; }
+
+// Alpha test: the quad's second triangle is cut out.
+@any_hit @incoming_payload(incoming)
+fn alphaTest(@builtin(primitive_index) primitive: u32) {
+  if (primitive == 1u) {
+    ignoreIntersection();
+  }
+}
+
+var<ray_hit_attribute> sphereHit: vec2<f32>;
+
+// A sphere of radius 0.45 at (0.55, 0, 0), inside the AABB.
+@intersection
+fn sphereIntersect(@builtin(object_ray_origin) o: vec3<f32>, @builtin(object_ray_direction) d: vec3<f32>,
+                   @builtin(ray_t_min) tmin: f32, @builtin(ray_t_current_max) tmax: f32) {
+  let oc = o - vec3(0.55, 0.0, 0.0);
+  let a = dot(d, d);
+  let b = dot(oc, d);
+  let c = dot(oc, oc) - 0.45 * 0.45;
+  let disc = b * b - a * c;
+  if (disc >= 0.0) {
+    let t = (-b - sqrt(disc)) / a;
+    if (t >= tmin && t <= tmax) {
+      sphereHit = vec2(t, 2.0);
+      reportIntersection(t, 7u);
+    }
+  }
+}
+
+var<callable_data> callData: CallData;
+
+@closest_hit @incoming_payload(incoming)
+fn hitSphere(@builtin(hit_kind) kind: u32) {
+  callData = CallData(kind + u32(sphereHit.y));
+  executeCallable(0u, &callData);
+  incoming.color = callData.v;
+}
+
+var<incoming_callable_data> incomingCall: CallData;
+
+@callable @incoming_payload(incomingCall)
+fn timesTenPlusFive() { incomingCall.v = incomingCall.v * 10u + 5u; }
+
+@closest_hit @incoming_payload(incomingProbe)
+fn probeTri() { incomingProbe.value = 90u; incomingProbe.extra = 10u; }
+
+@closest_hit @incoming_payload(incomingProbe)
+fn probeSphere() { incomingProbe.value = 150u; incomingProbe.extra = 50u; }
+`;
+
+// The quad (two triangles, local corners at +-0.5) is instanced twice: shifted to x -1..0, and scaled 0.4 and
+// moved to (-0.5, 0.78) with FORCE_OPAQUE, which skips the alpha test. Triangle 0 is below the local diagonal.
+const QUADS = [
+  { scale: 1, cx: -0.5, cy: 0, opaque: false },
+  { scale: 0.4, cx: -0.5, cy: 0.78, opaque: true },
+];
+const near = (a, b) => Math.abs(a - b) < 0.04;
+// What each pixel should be, or null on an edge where either answer is fine.
+function expected(i, j) {
+  const x = (i + 0.5) / SIZE * 2 - 1, y = (j + 0.5) / SIZE * 2 - 1;
+  for (const q of QUADS) {
+    const lx = (x - q.cx) / q.scale, ly = (y - q.cy) / q.scale;
+    if (near(Math.abs(lx), 0.5) || near(Math.abs(ly), 0.5) || (Math.abs(lx) < 0.5 && Math.abs(ly) < 0.5 && near(lx, ly))) return null;
+    if (Math.abs(lx) < 0.5 && Math.abs(ly) < 0.5) {
+      const triangle = ly > lx ? 1 : 0;
+      const primary = triangle === 0 ? 1 : q.opaque ? 17 : 3;
+      return [primary, 100];
+    }
+  }
+  const r = Math.hypot(x - 0.55, y);
+  if (near(r, 0.45)) return null;
+  if (r < 0.45) return [(7 + 2) * 10 + 5, 200];
+  return [3, 300];
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter.features.has("wgpu-ray-tracing-pipelines")) {
+    log("SKIP wgpu-ray-tracing-pipelines not offered (needs the Vulkan backend and the prototype pref)");
+    log("DONE");
+  } else {
+    const device = await adapter.requestDevice({ requiredFeatures: ["wgpu-ray-tracing-pipelines", "primitive-index"] });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+    device.pushErrorScope("validation");
+
+    const usage = GPUBufferUsage.BLAS_INPUT | GPUBufferUsage.COPY_DST;
+    const upload = (data) => {
+      const buffer = device.createBuffer({ size: data.byteLength, usage });
+      device.queue.writeBuffer(buffer, 0, data);
+      return buffer;
+    };
+    const vertexBuffer = upload(new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0]));
+    const indexBuffer = upload(new Uint32Array([0, 1, 2, 0, 2, 3]));
+    const aabbBuffer = upload(new Float32Array([0.1, -0.45, -0.45, 1.0, 0.45, 0.45]));
+
+    const quad = device.createBlas({ geometries: [{ vertexFormat: "float32x3", vertexCount: 4, indexFormat: "uint32", indexCount: 6, opaque: false }] });
+    const boxes = device.createBlas({ aabbGeometries: [{ primitiveCount: 1, opaque: false }] });
+    const tlas = device.createTlas({ maxInstances: 3 });
+    const image = device.createBuffer({ size: SIZE * SIZE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const probes = device.createBuffer({ size: SIZE * SIZE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readback = device.createBuffer({ size: SIZE * SIZE * 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+    const module = device.createShaderModule({ code: shader });
+    for (const m of (await module.getCompilationInfo()).messages) log(`shader ${m.type}: ${m.message}`);
+    const stage = (entryPoint) => ({ module, entryPoint });
+    const pipeline = device.createRayTracingPipeline({
+      layout: "auto",
+      rayGeneration: stage("generate"),
+      miss: [stage("missPrimary"), stage("missProbe")],
+      intersections: [
+        { closestHit: stage("hitTri"), anyHit: stage("alphaTest") },
+        { intersection: stage("sphereIntersect"), closestHit: stage("hitSphere") },
+        { closestHit: stage("probeTri") },
+        { intersection: stage("sphereIntersect"), closestHit: stage("probeSphere") },
+      ],
+      callables: [stage("timesTenPlusFive")],
+      maxRecursionDepth: 1,
+    });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: tlas },
+        { binding: 1, resource: { buffer: image } },
+        { binding: 2, resource: { buffer: probes } },
+      ],
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.buildAccelerationStructures(
+      [
+        { blas: quad, geometries: [{ vertexBuffer, vertexStride: 12, indexBuffer }] },
+        { blas: boxes, aabbGeometries: [{ buffer: aabbBuffer }] },
+      ],
+      [{ tlas, instances: [
+        ...QUADS.map((q) => ({
+          blas: quad, intersectionIndex: 0,
+          transform: [q.scale, 0, 0, q.cx, 0, q.scale, 0, q.cy, 0, 0, 1, 0],
+          flags: q.opaque ? GPUTlasInstanceFlag.FORCE_OPAQUE : 0,
+        })),
+        { blas: boxes, intersectionIndex: 1 },
+      ] }]);
+    const pass = encoder.beginRayTracingPass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group);
+    pass.traceRays(SIZE, SIZE);
+    pass.end();
+    encoder.copyBufferToBuffer(image, 0, readback, 0, SIZE * SIZE * 4);
+    encoder.copyBufferToBuffer(probes, 0, readback, SIZE * SIZE * 4, SIZE * SIZE * 4);
+    device.queue.submit([encoder.finish()]);
+    const error = await device.popErrorScope();
+    if (error) log(`validation error: ${error.message}`);
+
+    await readback.mapAsync(GPUMapMode.READ);
+    const all = new Uint32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+    const results = [all.subarray(0, SIZE * SIZE), all.subarray(SIZE * SIZE)];
+
+    const colours = { 1: [230, 80, 60], 17: [250, 170, 60], 3: [40, 40, 60], 95: [70, 110, 220], 100: [120, 200, 120], 200: [90, 150, 240], 300: [60, 40, 40] };
+    let checked = 0, mismatches = 0;
+    const counts = [{}, {}];
+    for (const [k, id] of ["primary", "probe"].entries()) {
+      const ctx = document.getElementById(id).getContext("2d");
+      const picture = ctx.createImageData(SIZE, SIZE);
+      for (let j = 0; j < SIZE; j++) {
+        for (let i = 0; i < SIZE; i++) {
+          const value = results[k][j * SIZE + i];
+          counts[k][value] = (counts[k][value] ?? 0) + 1;
+          const want = expected(i, j);
+          if (want) { checked++; if (value !== want[k]) mismatches++; }
+          const [r, g, b] = colours[value] ?? [0, 0, 0];
+          picture.data.set([r, g, b, 255], ((SIZE - 1 - j) * SIZE + i) * 4);
+        }
+      }
+      ctx.putImageData(picture, 0, 0);
+    }
+    const show = (c) => Object.entries(c).map(([v, n]) => `${v}:${n}`).join(" ");
+    log(`primary rays: ${show(counts[0])}`);
+    log(`second ray type: ${show(counts[1])}`);
+    log(`${mismatches === 0 && !error ? "PASS" : "FAIL"} ${checked - mismatches}/${checked} pixels away from edges match`);
+    log("DONE");
+  }
+} catch (e) {
+  log(`ERROR ${e?.message ?? e}`);
+  log("DONE");
+}
+</script>

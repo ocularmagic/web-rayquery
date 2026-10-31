@@ -1,0 +1,184 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Shader execution reordering test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>Shader execution reordering test</h1>
+<p>A deliberately incoherent workload: 1024×1024 rays aimed at random spots on 64 squares, each square sent to one of
+8 hit groups with its own expensive closest-hit shader. Without reordering, neighbouring invocations run different
+hit shaders; <code>traceRayReordered</code> lets the GPU regroup them first. Both must produce the same image; the GPU
+time of each is measured with timestamps. Results are also printed as <code>SER ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("SER " + line); };
+const SIZE = 1024, GROUPS = 8, GRID = 8, RUNS = 7;
+
+const hitShaders = Array.from({ length: GROUPS }, (_, g) => `
+@closest_hit @incoming_payload(incoming)
+fn hit${g}(@builtin(instance_index) instance: u32, @builtin(primitive_index) primitive: u32) {
+  var v = f32(instance * 3u + primitive + ${g}u) * 0.001;
+  for (var k = 0u; k < ${400 + g * 60}u; k++) {
+    v = fract(sin(v * ${(1.37 + g * 0.71).toFixed(2)} + f32(k) * 0.013) * ${(43758.5 + g * 97).toFixed(1)});
+  }
+  incoming.value = ${g + 1}u * 1000000u + u32(v * 1000.0);
+}`).join("\n");
+
+const shader = `
+enable wgpu_ray_tracing_pipeline;
+enable primitive_index;
+
+struct Payload { value: u32 }
+var<ray_payload> payload: Payload;
+var<incoming_ray_payload> incoming: Payload;
+
+@group(0) @binding(0) var scene: acceleration_structure;
+@group(0) @binding(1) var<storage, read_write> image: array<u32>;
+
+fn hash(x: u32) -> u32 {
+  var h = x * 747796405u + 2891336453u;
+  h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+  return (h >> 22u) ^ h;
+}
+
+fn ray(id: vec3<u32>, count: vec3<u32>) -> RayDesc {
+  let index = id.y * count.x + id.x;
+  // A random spot on the grid, so neighbouring invocations hit unrelated squares.
+  let x = f32(hash(index) & 0xffffu) / 65535.0 * 2.0 - 1.0;
+  let y = f32(hash(index ^ 0x9e3779b9u) & 0xffffu) / 65535.0 * 2.0 - 1.0;
+  return RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 100.0, vec3(x * 0.98, y * 0.98, 1.0), vec3(0.0, 0.0, -1.0));
+}
+
+@ray_generation
+fn plain(@builtin(ray_invocation_id) id: vec3<u32>, @builtin(num_ray_invocations) count: vec3<u32>) {
+  payload = Payload(0u);
+  traceRay(scene, ray(id, count), &payload);
+  image[id.y * count.x + id.x] = payload.value;
+}
+
+@ray_generation
+fn reordered(@builtin(ray_invocation_id) id: vec3<u32>, @builtin(num_ray_invocations) count: vec3<u32>) {
+  payload = Payload(0u);
+  traceRayReordered(scene, ray(id, count), &payload);
+  image[id.y * count.x + id.x] = payload.value;
+}
+
+@ray_generation
+fn hinted(@builtin(ray_invocation_id) id: vec3<u32>, @builtin(num_ray_invocations) count: vec3<u32>) {
+  payload = Payload(0u);
+  traceRayReordered(scene, ray(id, count), &payload, 0u, 0u);
+  image[id.y * count.x + id.x] = payload.value;
+}
+
+@miss @incoming_payload(incoming)
+fn missed() { incoming.value = 7u; }
+
+${hitShaders}
+
+@compute @workgroup_size(1) fn marker() {}
+`;
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter.features.has("wgpu-ray-tracing-pipelines")) {
+    log("SKIP ray tracing pipelines not offered (needs the Vulkan backend)");
+  } else {
+    const device = await adapter.requestDevice({ requiredFeatures: ["wgpu-ray-tracing-pipelines", "primitive-index", "timestamp-query"] });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+    const module = device.createShaderModule({ code: shader });
+    for (const m of (await module.getCompilationInfo()).messages) log(`shader ${m.type}: ${m.message}`);
+
+    // One square, 64 instances in an 8x8 grid covering -1..1; instance i uses hit group i % 8.
+    const half = 1 / GRID;
+    const vertices = new Float32Array([-half, -half, 0, half, -half, 0, half, half, 0, -half, half, 0]);
+    const indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
+    const usage = GPUBufferUsage.BLAS_INPUT | GPUBufferUsage.COPY_DST;
+    const vertexBuffer = device.createBuffer({ size: vertices.byteLength, usage });
+    const indexBuffer = device.createBuffer({ size: indices.byteLength, usage });
+    device.queue.writeBuffer(vertexBuffer, 0, vertices);
+    device.queue.writeBuffer(indexBuffer, 0, indices);
+    const blas = device.createBlas({ geometries: [{ vertexFormat: "float32x3", vertexCount: 4, indexFormat: "uint32", indexCount: 6 }] });
+    const tlas = device.createTlas({ maxInstances: GRID * GRID });
+    const instances = [];
+    for (let j = 0; j < GRID; j++) {
+      for (let i = 0; i < GRID; i++) {
+        const cx = -1 + half + i * 2 * half, cy = -1 + half + j * 2 * half;
+        instances.push({ blas, transform: [1, 0, 0, cx, 0, 1, 0, cy, 0, 0, 1, 0], intersectionIndex: (j * GRID + i) % GROUPS });
+      }
+    }
+    const build = device.createCommandEncoder();
+    build.buildAccelerationStructures([{ blas, geometries: [{ vertexBuffer, vertexStride: 12, indexBuffer }] }], [{ tlas, instances }]);
+    device.queue.submit([build.finish()]);
+
+    const image = device.createBuffer({ size: SIZE * SIZE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const marker = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "marker" } });
+    const querySet = device.createQuerySet({ type: "timestamp", count: 2 });
+    const resolved = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+
+    const intersections = Array.from({ length: GROUPS }, (_, g) => ({ closestHit: { module, entryPoint: `hit${g}` } }));
+    const pipelines = {};
+    for (const name of ["plain", "reordered", "hinted"]) {
+      device.pushErrorScope("validation");
+      pipelines[name] = device.createRayTracingPipeline({ layout: "auto", rayGeneration: { module, entryPoint: name }, miss: { module, entryPoint: "missed" }, intersections, maxRecursionDepth: 1 });
+      const error = await device.popErrorScope();
+      if (error) log(`${name} pipeline error: ${error.message}`);
+    }
+
+    async function run(name) {
+      const pipeline = pipelines[name];
+      const group = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: tlas }, { binding: 1, resource: { buffer: image } }] });
+      const encoder = device.createCommandEncoder();
+      const before = encoder.beginComputePass({ timestampWrites: { querySet, endOfPassWriteIndex: 0 } });
+      before.setPipeline(marker);
+      before.dispatchWorkgroups(1);
+      before.end();
+      const pass = encoder.beginRayTracingPass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, group);
+      pass.traceRays(SIZE, SIZE);
+      pass.end();
+      const after = encoder.beginComputePass({ timestampWrites: { querySet, beginningOfPassWriteIndex: 1 } });
+      after.setPipeline(marker);
+      after.dispatchWorkgroups(1);
+      after.end();
+      encoder.resolveQuerySet(querySet, 0, 2, resolved, 0);
+      const readTimes = device.createBuffer({ size: 16, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      const readImage = device.createBuffer({ size: SIZE * SIZE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      encoder.copyBufferToBuffer(resolved, 0, readTimes, 0, 16);
+      encoder.copyBufferToBuffer(image, 0, readImage, 0, SIZE * SIZE * 4);
+      device.queue.submit([encoder.finish()]);
+      await Promise.all([readTimes.mapAsync(GPUMapMode.READ), readImage.mapAsync(GPUMapMode.READ)]);
+      const t = new BigUint64Array(readTimes.getMappedRange());
+      const ms = Number(t[1] - t[0]) / 1e6;
+      const pixels = new Uint32Array(readImage.getMappedRange().slice(0));
+      readTimes.unmap();
+      readImage.unmap();
+      return { ms, pixels };
+    }
+
+    const results = {};
+    for (const name of ["plain", "reordered", "hinted"]) {
+      const times = [];
+      let pixels;
+      for (let r = 0; r < RUNS; r++) {
+        const result = await run(name);
+        times.push(result.ms);
+        pixels = result.pixels;
+      }
+      times.sort((a, b) => a - b);
+      results[name] = { median: times[Math.floor(RUNS / 2)], pixels };
+      log(`${name}: median ${times[Math.floor(RUNS / 2)].toFixed(2)} ms over ${RUNS} runs (all: ${times.map((x) => x.toFixed(2)).join(", ")})`);
+    }
+    for (const name of ["reordered", "hinted"]) {
+      let differ = 0;
+      const a = results.plain.pixels, b = results[name].pixels;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) differ++;
+      log(`${name} image ${differ === 0 ? "PASS" : "FAIL"}: ${differ} of ${a.length} pixels differ from plain traceRay`);
+      log(`${name} speed: ${(results.plain.median / results[name].median).toFixed(2)}x plain`);
+    }
+  }
+  log("DONE");
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>

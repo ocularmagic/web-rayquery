@@ -1,0 +1,208 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Cooperative vector test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>Cooperative vector test</h1>
+<p>Feature <code>wgpu-cooperative-vector</code> (Vulkan, NVIDIA): each invocation runs a small neural-network layer,
+<code>y = W·x + b</code> with a 16×16 <code>f16</code> matrix from a storage buffer, through WGSL
+<code>coopVecMatMulAdd</code> (and <code>coopVecMatMul</code> reading the matrix column-major, so Wᵀ·x). Small integers keep every
+value exact in <code>f16</code>, so the results must equal the CPU's. Results are also printed as
+<code>COOPVEC ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("COOPVEC " + line); };
+const N = 256, K = 16;
+
+// Small integers only, so f16 bits are easy and exact.
+function f16(value) {
+  if (value === 0) return 0;
+  const sign = value < 0 ? 0x8000 : 0;
+  let v = Math.abs(value), exponent = 15;
+  while (v >= 2) { v /= 2; exponent++; }
+  while (v < 1) { v *= 2; exponent--; }
+  return sign | (exponent << 10) | Math.round((v - 1) * 1024);
+}
+const random = (seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff)(7);
+const int = (lo, hi) => lo + Math.floor(random() * (hi - lo + 1));
+
+const W = Array.from({ length: K * K }, () => int(-2, 2));
+const b = Array.from({ length: K }, () => int(-4, 4));
+const X = Array.from({ length: N * K }, () => int(-3, 3));
+
+const shader = `
+enable f16;
+@group(0) @binding(0) var<storage, read> weights: array<f16>;
+@group(0) @binding(1) var<storage, read> inputs: array<f16>;
+@group(0) @binding(2) var<storage, read_write> outputs: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= ${N}u) { return; }
+  var x: array<f16, ${K}>;
+  for (var i = 0u; i < ${K}u; i++) { x[i] = inputs[id.x * ${K}u + i]; }
+  // W·x + b: row-major (layout 0), f16 (component type 0), rows 32 bytes apart; the bias follows W.
+  let y = coopVecMatMulAdd(x, &weights, 0u, &weights, ${K * K * 2}u, ${K}u, 0u, 0u, 0u, 0u, ${K * 2}u);
+  // Wᵀ·x, no bias: the same data read as column-major (layout 1).
+  let z = coopVecMatMul(x, &weights, 0u, ${K}u, 0u, 1u, 0u, ${K * 2}u);
+  for (var i = 0u; i < ${K}u; i++) {
+    outputs[id.x * ${K * 2}u + i] = f32(y[i]);
+    outputs[id.x * ${K * 2}u + ${K}u + i] = f32(z[i]);
+  }
+}`;
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const wanted = ["wgpu-cooperative-vector", "shader-f16"];
+  const missing = wanted.filter((f) => !adapter.features.has(f));
+  if (missing.length) {
+    log(`wgpu-cooperative-vector SKIP (not offered: ${missing.join(", ")})`);
+    log("DONE");
+  } else {
+    const device = await adapter.requestDevice({ requiredFeatures: wanted });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+    device.pushErrorScope("validation");
+    const upload = (values) => {
+      const data = new Uint16Array(values.map(f16));
+      const buffer = device.createBuffer({ size: Math.ceil(data.byteLength / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(buffer, 0, data.buffer, 0, Math.ceil(data.byteLength / 4) * 4);
+      return buffer;
+    };
+    const weights = upload([...W, ...b]);
+    const inputs = upload(X);
+    const outputs = device.createBuffer({ size: N * K * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readback = device.createBuffer({ size: N * K * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+    const module = device.createShaderModule({ code: shader });
+    for (const m of (await module.getCompilationInfo()).messages) log(`shader ${m.type}: ${m.message}`);
+    const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: weights } },
+        { binding: 1, resource: { buffer: inputs } },
+        { binding: 2, resource: { buffer: outputs } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(N / 64);
+    pass.end();
+    encoder.copyBufferToBuffer(outputs, 0, readback, 0, N * K * 2 * 4);
+    device.queue.submit([encoder.finish()]);
+    const error = await device.popErrorScope();
+    if (error) log(`validation error: ${error.message}`);
+
+    await readback.mapAsync(GPUMapMode.READ);
+    const got = new Float32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+    let wrongY = 0, wrongZ = 0, sample = "";
+    for (let n = 0; n < N; n++) {
+      for (let r = 0; r < K; r++) {
+        let y = b[r], z = 0;
+        for (let c = 0; c < K; c++) {
+          y += W[r * K + c] * X[n * K + c];
+          z += W[c * K + r] * X[n * K + c];
+        }
+        if (got[n * K * 2 + r] !== y) wrongY++;
+        if (got[n * K * 2 + K + r] !== z) wrongZ++;
+        if (n === 0 && r < 4) sample += ` y${r}=${got[r]} (cpu ${y})`;
+      }
+    }
+    log(`first outputs:${sample}`);
+    log(`coopVecMatMulAdd ${wrongY === 0 && !error ? "PASS" : "FAIL"} ${N * K - wrongY}/${N * K} outputs equal the CPU's`);
+    log(`coopVecMatMul column-major ${wrongZ === 0 && !error ? "PASS" : "FAIL"} ${N * K - wrongZ}/${N * K} outputs equal the CPU's`);
+
+    // ---- Matrix conversion on the GPU: W to the inferencing-optimal layout, as f16 and as float8 (e4m3).
+    const TYPE = { 0: "f16", 1: "f32", 3: "i8", 5: "i32", 7: "u8", 9: "u32", 1000491000: "i8-packed", 1000491001: "u8-packed", 1000491002: "e4m3", 1000491003: "e5m2" };
+    const props = [...new BigUint64Array(await device.getCooperativeVectorProperties())].map(Number);
+    const combos = [];
+    for (let i = 0; i + 6 <= props.length; i += 6) combos.push(props.slice(i, i + 6));
+    log(`supported multiplies (input/input interpretation/matrix/bias/result, T = transpose): ${
+      combos.map((c) => c.slice(0, 5).map((t) => TYPE[t] ?? t).join("/") + (c[5] ? " T" : "")).join(", ")}`);
+    const E4M3 = 1000491002;
+    const fp8 = combos.some((c) => c[0] === 0 && c[1] === E4M3 && c[2] === E4M3 && c[4] === 0);
+
+    const rowMajor16 = { componentType: "float16", layout: "row-major", stride: K * 2 };
+    const optimal16 = { componentType: "float16", layout: "inferencing-optimal" };
+    const optimal8 = { componentType: "float8-e4m3", layout: "inferencing-optimal" };
+    const matrixSize = async (dst) =>
+      Number(new BigUint64Array(await device.getCooperativeVectorMatrixSize({ rows: K, columns: K, src: rowMajor16, dst }))[0]);
+    const size16 = await matrixSize(optimal16), size8 = fp8 ? await matrixSize(optimal8) : 0;
+    log(`inferencing-optimal sizes: f16 ${size16} bytes, e4m3 ${size8} bytes (row-major f16: ${K * K * 2})`);
+    const optimalBuffer = (size) => device.createBuffer({ size: Math.max(256, Math.ceil(size / 256) * 256), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const matrix16 = optimalBuffer(size16), matrix8 = optimalBuffer(size8);
+
+    const shader2 = `
+enable f16;
+@group(0) @binding(0) var<storage, read> optimal16: array<f16>;
+${fp8 ? "@group(0) @binding(1) var<storage, read> optimal8: array<u32>;" : ""}
+@group(0) @binding(2) var<storage, read> inputs: array<f16>;
+@group(0) @binding(3) var<storage, read_write> outputs: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= ${N}u) { return; }
+  var x: array<f16, ${K}>;
+  for (var i = 0u; i < ${K}u; i++) { x[i] = inputs[id.x * ${K}u + i]; }
+  // Inferencing-optimal layout (2), no stride.
+  let y = coopVecMatMul(x, &optimal16, 0u, ${K}u, 0u, 2u, 0u, 0u);
+  for (var i = 0u; i < ${K}u; i++) { outputs[id.x * ${K * 2}u + i] = f32(y[i]); }
+  ${fp8 ? `// e4m3 matrix; the f16 input is read as e4m3 too (the last argument).
+  let z = coopVecMatMul(x, &optimal8, 0u, ${K}u, ${E4M3}u, 2u, 0u, 0u, ${E4M3}u);
+  for (var i = 0u; i < ${K}u; i++) { outputs[id.x * ${K * 2}u + ${K}u + i] = f32(z[i]); }` : ""}
+}`;
+    device.pushErrorScope("validation");
+    const module2 = device.createShaderModule({ code: shader2 });
+    for (const m of (await module2.getCompilationInfo()).messages) log(`shader 2 ${m.type}: ${m.message}`);
+    const pipeline2 = device.createComputePipeline({ layout: "auto", compute: { module: module2, entryPoint: "main" } });
+    const group2 = device.createBindGroup({
+      layout: pipeline2.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: matrix16 } },
+        ...(fp8 ? [{ binding: 1, resource: { buffer: matrix8 } }] : []),
+        { binding: 2, resource: { buffer: inputs } },
+        { binding: 3, resource: { buffer: outputs } },
+      ],
+    });
+    const encoder2 = device.createCommandEncoder();
+    encoder2.convertCooperativeVectorMatrices([
+      { rows: K, columns: K, src: rowMajor16, dst: optimal16, srcBuffer: { buffer: weights, size: K * K * 2 }, dstBuffer: { buffer: matrix16 } },
+      ...(fp8 ? [{ rows: K, columns: K, src: rowMajor16, dst: optimal8, srcBuffer: { buffer: weights, size: K * K * 2 }, dstBuffer: { buffer: matrix8 } }] : []),
+    ]);
+    const pass2 = encoder2.beginComputePass();
+    pass2.setPipeline(pipeline2);
+    pass2.setBindGroup(0, group2);
+    pass2.dispatchWorkgroups(N / 64);
+    pass2.end();
+    encoder2.copyBufferToBuffer(outputs, 0, readback, 0, N * K * 2 * 4);
+    device.queue.submit([encoder2.finish()]);
+    const error2 = await device.popErrorScope();
+    if (error2) log(`validation error: ${error2.message}`);
+    await readback.mapAsync(GPUMapMode.READ);
+    const got2 = new Float32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+    let wrong16 = 0, wrong8 = 0;
+    for (let n = 0; n < N; n++) {
+      for (let r = 0; r < K; r++) {
+        let y = 0;
+        for (let c = 0; c < K; c++) y += W[r * K + c] * X[n * K + c];
+        if (got2[n * K * 2 + r] !== y) wrong16++;
+        if (got2[n * K * 2 + K + r] !== y) wrong8++;
+      }
+    }
+    log(`matrix conversion to f16 inferencing-optimal ${wrong16 === 0 && !error2 && size16 > 0 ? "PASS" : "FAIL"} ${N * K - wrong16}/${N * K} outputs equal the CPU's`);
+    if (fp8) {
+      log(`matrix conversion to e4m3 inferencing-optimal ${wrong8 === 0 && !error2 && size8 > 0 ? "PASS" : "FAIL"} ${N * K - wrong8}/${N * K} outputs equal the CPU's`);
+    } else {
+      log("matrix conversion to e4m3 SKIP (no f16-input e4m3 multiply listed)");
+    }
+    log("DONE");
+  }
+} catch (e) {
+  log(`ERROR ${e?.message ?? e}`);
+  log("DONE");
+}
+</script>

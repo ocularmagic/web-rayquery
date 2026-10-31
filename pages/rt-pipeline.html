@@ -1,0 +1,176 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Ray tracing pipeline test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; }
+  canvas { image-rendering: pixelated; width: 256px; height: 256px; border: 1px solid #888; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>Ray tracing pipeline test</h1>
+<p>Two instances of one square, each sent to its own hit group by <code>intersectionIndex</code>; rays that miss run the
+miss shader. Every pixel is checked against the expected answer. Results are also printed to the console as
+<code>RTP ...</code> lines.</p>
+<canvas id="view" width="64" height="64"></canvas>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("RTP " + line); };
+const SIZE = 64;
+
+const shader = `
+enable wgpu_ray_tracing_pipeline;
+enable primitive_index;
+
+struct Payload { color: u32 }
+var<ray_payload> payload: Payload;
+
+@group(0) @binding(0) var scene: acceleration_structure;
+@group(0) @binding(1) var<storage, read_write> image: array<u32>;
+
+@ray_generation
+fn generate(@builtin(ray_invocation_id) id: vec3<u32>, @builtin(num_ray_invocations) count: vec3<u32>) {
+  payload = Payload(0u);
+  let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(count.xy) * 2.0 - 1.0;
+  traceRay(scene, RayDesc(RAY_FLAG_NONE, 0xffu, 0.001, 100.0, vec3(uv.x, uv.y, 1.0), vec3(0.0, 0.0, -1.0)), &payload);
+  image[id.y * count.x + id.x] = payload.color;
+}
+
+var<incoming_ray_payload> incoming: Payload;
+
+@miss
+@incoming_payload(incoming)
+fn missed() { incoming.color = 3u; }
+
+@closest_hit
+@incoming_payload(incoming)
+fn hitA(@builtin(instance_custom_data) data: u32) { incoming.color = 1u + data * 16u; }
+
+@closest_hit
+@incoming_payload(incoming)
+fn hitB(@builtin(primitive_index) primitive: u32) { incoming.color = 2u + primitive * 16u; }
+`;
+
+// What each pixel should be: instance A (custom data 5) covers x -1..0, instance B (shifted 0.55) covers
+// x 0.05..1.05, both y -0.5..0.5. B's triangle 0 is below its diagonal, triangle 1 above.
+function expected(i, j) {
+  const x = (i + 0.5) / SIZE * 2 - 1, y = (j + 0.5) / SIZE * 2 - 1;
+  if (Math.abs(y) <= 0.5 && x >= -1 && x <= 0) return 1 + 5 * 16;
+  const bx = x - 0.55;
+  if (Math.abs(y) <= 0.5 && Math.abs(bx) <= 0.5) return 2 + (y > bx ? 1 : 0) * 16;
+  return 3;
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter.features.has("wgpu-ray-tracing-pipelines")) {
+    log("SKIP wgpu-ray-tracing-pipelines not offered (needs the Vulkan backend and the prototype pref)");
+    log("DONE");
+  } else {
+    const device = await adapter.requestDevice({ requiredFeatures: ["wgpu-ray-tracing-pipelines", "primitive-index"] });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+    device.pushErrorScope("validation");
+
+    const vertices = new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0]);
+    const indices = new Uint32Array([0, 1, 2, 0, 2, 3]);
+    const usage = GPUBufferUsage.BLAS_INPUT | GPUBufferUsage.COPY_DST;
+    const vertexBuffer = device.createBuffer({ size: vertices.byteLength, usage });
+    const indexBuffer = device.createBuffer({ size: indices.byteLength, usage });
+    device.queue.writeBuffer(vertexBuffer, 0, vertices);
+    device.queue.writeBuffer(indexBuffer, 0, indices);
+
+    const blas = device.createBlas({ geometries: [{ vertexFormat: "float32x3", vertexCount: 4, indexFormat: "uint32", indexCount: 6 }] });
+    const tlas = device.createTlas({ maxInstances: 2 });
+    const image = device.createBuffer({ size: SIZE * SIZE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+    const readback = device.createBuffer({ size: SIZE * SIZE * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+    const module = device.createShaderModule({ code: shader });
+    const info = await module.getCompilationInfo();
+    for (const m of info.messages) log(`shader ${m.type}: ${m.message}`);
+
+    const pipeline = device.createRayTracingPipeline({
+      layout: "auto",
+      rayGeneration: { module, entryPoint: "generate" },
+      miss: { module, entryPoint: "missed" },
+      intersections: [
+        { closestHit: { module, entryPoint: "hitA" } },
+        { closestHit: { module, entryPoint: "hitB" } },
+      ],
+      maxRecursionDepth: 1,
+    });
+    const group = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: tlas }, { binding: 1, resource: { buffer: image } }],
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.buildAccelerationStructures(
+      [{ blas, geometries: [{ vertexBuffer, vertexStride: 12, indexBuffer }] }],
+      [{ tlas, instances: [
+        { blas, transform: [1, 0, 0, -0.5, 0, 1, 0, 0, 0, 0, 1, 0], customData: 5, intersectionIndex: 0 },
+        { blas, transform: [1, 0, 0, 0.55, 0, 1, 0, 0, 0, 0, 1, 0], customData: 9, intersectionIndex: 1 },
+      ] }]);
+    const pass = encoder.beginRayTracingPass({ label: "test pass" });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group);
+    pass.traceRays(SIZE, SIZE);
+    pass.end();
+    encoder.copyBufferToBuffer(image, 0, readback, 0, SIZE * SIZE * 4);
+    device.queue.submit([encoder.finish()]);
+    const error = await device.popErrorScope();
+    if (error) log(`validation error: ${error.message}`);
+
+    await readback.mapAsync(GPUMapMode.READ);
+    const pixels = new Uint32Array(readback.getMappedRange().slice(0));
+    readback.unmap();
+
+    const counts = {};
+    let mismatches = 0;
+    const ctx = document.getElementById("view").getContext("2d");
+    const picture = ctx.createImageData(SIZE, SIZE);
+    const colours = { 81: [230, 80, 60], 2: [60, 180, 90], 18: [40, 120, 60], 3: [70, 110, 220] };
+    for (let j = 0; j < SIZE; j++) {
+      for (let i = 0; i < SIZE; i++) {
+        const value = pixels[j * SIZE + i];
+        counts[value] = (counts[value] ?? 0) + 1;
+        if (value !== expected(i, j)) mismatches++;
+        const [r, g, b] = colours[value] ?? [0, 0, 0];
+        const p = ((SIZE - 1 - j) * SIZE + i) * 4;
+        picture.data.set([r, g, b, 255], p);
+      }
+    }
+    ctx.putImageData(picture, 0, 0);
+    log(`pixel values: ${JSON.stringify(counts)} (81 = hit group 0, 2/18 = hit group 1 triangles, 3 = miss)`);
+    log(`${mismatches === 0 ? "PASS" : "FAIL"} ${mismatches} of ${SIZE * SIZE} pixels differ from the expected answer`);
+
+    // Prototype: traceRaysIndirect, with the counts read from a buffer (at offset 4) into a cleared image.
+    if (typeof pass.traceRaysIndirect !== "function") {
+      log("traceRaysIndirect SKIP (not in this build)");
+    } else {
+      const counts3 = device.createBuffer({ size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(counts3, 0, new Uint32Array([0, SIZE, SIZE, 1]));
+      device.pushErrorScope("validation");
+      const encoder2 = device.createCommandEncoder();
+      encoder2.clearBuffer(image);
+      const pass2 = encoder2.beginRayTracingPass({ label: "indirect pass" });
+      pass2.setPipeline(pipeline);
+      pass2.setBindGroup(0, group);
+      pass2.traceRaysIndirect(counts3, 4);
+      pass2.end();
+      encoder2.copyBufferToBuffer(image, 0, readback, 0, SIZE * SIZE * 4);
+      device.queue.submit([encoder2.finish()]);
+      const error2 = await device.popErrorScope();
+      if (error2) log(`validation error: ${error2.message}`);
+      await readback.mapAsync(GPUMapMode.READ);
+      const pixels2 = new Uint32Array(readback.getMappedRange().slice(0));
+      readback.unmap();
+      let mismatches2 = 0;
+      for (let j = 0; j < SIZE; j++) for (let i = 0; i < SIZE; i++) if (pixels2[j * SIZE + i] !== expected(i, j)) mismatches2++;
+      log(`traceRaysIndirect ${mismatches2 === 0 && !error2 ? "PASS" : "FAIL"} ${mismatches2} of ${SIZE * SIZE} pixels differ from the expected answer`);
+    }
+    log("DONE");
+  }
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>

@@ -1,2 +1,3 @@
-# Keep patches byte-exact so `git apply` works on any OS.
-*.patch text eol=lf
+# Keep patches byte-exact so `git apply` works on any OS (wgpu-vendored.patch has
+# CRLF lines from a vendored file that is stored with CRLF endings).
+*.patch -text

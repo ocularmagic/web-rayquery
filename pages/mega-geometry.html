@@ -1,0 +1,349 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mega Geometry test</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; }
+  canvas { image-rendering: pixelated; width: 512px; height: 384px; border: 1px solid #888; }
+  pre { white-space: pre-wrap; }
+</style>
+<h1>Mega Geometry test</h1>
+<p>Features <code>wgpu-partitioned-acceleration-structure</code> and <code>wgpu-cluster-acceleration-structure</code>
+(Vulkan, NVIDIA RTX Mega Geometry). Every build reads GPU-style argument arrays that refer to buffers and BLASes by
+device address. Top strip: a partitioned TLAS with four instances of an ordinary quad BLAS in two partitions. Middle
+strip: the same TLAS updated in place, rewriting instance 3 with a new position and ID. Bottom strip: four triangle
+clusters built from vertex data, a BLAS built from those clusters, and a partitioned TLAS with two instances of it;
+the BLAS address the GPU wrote is copied into the instance records. Ray queries write <code>1 + 16 × instance ID +
+primitive index</code> per pixel, compared with the CPU's answer away from edges. Results are also printed as
+<code>MEGA ...</code> lines.</p>
+<canvas id="view" width="128" height="96"></canvas>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("MEGA " + line); };
+const W = 128, H = 32;
+const X0 = -4, X1 = 4;
+
+const shader = `
+enable wgpu_ray_query;
+@group(0) @binding(0) var scene: acceleration_structure;
+@group(0) @binding(1) var<storage, read_write> image: array<u32>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= ${W}u || id.y >= ${H}u) { return; }
+  let x = ${X0}.0 + (f32(id.x) + 0.5) / ${W}.0 * ${X1 - X0}.0;
+  let y = (f32(id.y) + 0.5) / ${H}.0 * 2.0 - 1.0;
+  var rq: ray_query;
+  rayQueryInitialize(&rq, scene, RayDesc(0u, 0xffu, 0.001, 100.0, vec3(x, y, 1.0), vec3(0.0, 0.0, -1.0)));
+  rayQueryProceed(&rq);
+  let hit = rayQueryGetCommittedIntersection(&rq);
+  var value = 0u;
+  if (hit.kind != RAY_QUERY_INTERSECTION_NONE) {
+    value = 1u + hit.instance_custom_data * 16u + hit.primitive_index;
+  }
+  image[id.y * ${W}u + id.x] = value;
+}`;
+
+const pixelX = (i) => X0 + (i + 0.5) / W * (X1 - X0);
+const pixelY = (j) => (j + 0.5) / H * 2 - 1;
+const near = (a, b) => Math.abs(a - b) < 0.05;
+
+// Quads (two triangles, the first below the diagonal from the low corner to the high one).
+// Returns the expected pixel value, or null near an edge.
+function quadValue(x, y, quads) {
+  for (const q of quads) {
+    if (near(x, q.x0) || near(x, q.x1) || near(y, q.y0) || near(y, q.y1)) return null;
+    if (x > q.x0 && x < q.x1 && y > q.y0 && y < q.y1) {
+      const u = (x - q.x0) / (q.x1 - q.x0), v = (y - q.y0) / (q.y1 - q.y0);
+      if (Math.abs(u - v) < 0.06) return null;
+      return 1 + q.id * 16 + (v > u ? 1 : 0);
+    }
+  }
+  return 0;
+}
+
+// VkPartitionedAccelerationStructureWriteInstanceDataNV: 104 bytes.
+const INSTANCE_SIZE = 104;
+function writeInstance(view, offset, { cx, id, index, partition, address }) {
+  [1, 0, 0, cx, 0, 1, 0, 0, 0, 0, 1, 0].forEach((v, k) => view.setFloat32(offset + k * 4, v, true));
+  view.setUint32(offset + 72, id, true);      // instanceID
+  view.setUint32(offset + 76, 0xff, true);    // instanceMask
+  view.setUint32(offset + 80, 0, true);       // instanceContributionToHitGroupIndex
+  view.setUint32(offset + 84, 4, true);       // FORCE_OPAQUE
+  view.setUint32(offset + 88, index, true);   // instanceIndex
+  view.setUint32(offset + 92, partition, true);
+  view.setBigUint64(offset + 96, address, true);
+}
+// VkBuildPartitionedAccelerationStructureIndirectCommandNV: op type, arg count, strided args.
+function writeCommand(view, offset, opType, argCount, address, stride) {
+  view.setUint32(offset, opType, true);
+  view.setUint32(offset + 4, argCount, true);
+  view.setBigUint64(offset + 8, address, true);
+  view.setBigUint64(offset + 16, BigInt(stride), true);
+}
+
+const pictures = [];
+function check(name, pixels, expected) {
+  let checked = 0, mismatches = 0, first = "";
+  const counts = {};
+  for (let j = 0; j < H; j++) {
+    for (let i = 0; i < W; i++) {
+      const value = pixels[j * W + i];
+      counts[value] = (counts[value] ?? 0) + 1;
+      const want = expected(pixelX(i), pixelY(j));
+      if (want === null) continue;
+      checked++;
+      if (value !== want) {
+        mismatches++;
+        if (!first) first = ` (first at x=${pixelX(i).toFixed(2)} y=${pixelY(j).toFixed(2)}: got ${value}, want ${want})`;
+      }
+    }
+  }
+  pictures.push(pixels);
+  log(`${name} values: ${Object.entries(counts).map(([v, n]) => `${v}:${n}`).join(" ")}`);
+  log(`${name} ${mismatches === 0 ? "PASS" : "FAIL"} ${checked - mismatches}/${checked} pixels away from edges match${first}`);
+  return mismatches === 0;
+}
+
+function draw() {
+  const ctx = document.getElementById("view").getContext("2d");
+  const picture = ctx.createImageData(W, H * 3);
+  pictures.forEach((pixels, strip) => {
+    for (let j = 0; j < H; j++) {
+      for (let i = 0; i < W; i++) {
+        const value = pixels[j * W + i];
+        const id = value ? (value - 1) >> 4 : -1, triangle = value ? (value - 1) & 15 : 0;
+        const hue = id * 67 % 360, light = triangle ? 65 : 45;
+        const rgb = value ? hsl(hue, 70, light) : [30, 30, 40];
+        picture.data.set([...rgb, 255], ((strip * H + H - 1 - j) * W + i) * 4);
+      }
+    }
+  });
+  ctx.putImageData(picture, 0, 0);
+}
+function hsl(h, s, l) {
+  s /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12, a = s * Math.min(l, 1 - l);
+  const f = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [f(0), f(8), f(4)].map((v) => Math.round(v * 255));
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  const partitionedName = "wgpu-partitioned-acceleration-structure", clusterName = "wgpu-cluster-acceleration-structure";
+  const hasPartitioned = adapter.features.has(partitionedName), hasClusters = adapter.features.has(clusterName);
+  if (!adapter.features.has("experimental-ray-query") || !hasPartitioned) {
+    log(`${partitionedName} SKIP (not offered; Vulkan on NVIDIA only)`);
+    log(`${clusterName} SKIP (needs ${partitionedName} here)`);
+    log("DONE");
+  } else {
+    const device = await adapter.requestDevice({
+      requiredFeatures: ["experimental-ray-query", partitionedName, ...(hasClusters ? [clusterName] : [])],
+    });
+    device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+
+    const ADDRESSED = GPUBufferUsage.BLAS_INPUT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const buffer = (size) => device.createBuffer({ size: Math.max(16, Math.ceil(size / 16) * 16), usage: ADDRESSED });
+    const upload = (bytes) => {
+      const b = buffer(bytes.byteLength);
+      const padded = new Uint8Array(Math.ceil(bytes.byteLength / 4) * 4);
+      padded.set(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+      device.queue.writeBuffer(b, 0, padded);
+      return b;
+    };
+    const addresses = async (resources) => {
+      const values = [...new BigUint64Array(await device.getDeviceAddresses(resources))];
+      if (values.some((a) => a === 0n)) throw new Error(`a device address is 0: ${values.join(", ")}`);
+      return values;
+    };
+
+    const layout = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, accelerationStructure: { partitioned: true } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }] });
+    const module = device.createShaderModule({ code: shader });
+    for (const m of (await module.getCompilationInfo()).messages) log(`shader ${m.type}: ${m.message}`);
+    const pipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+      compute: { module, entryPoint: "main" },
+    });
+    const image = device.createBuffer({ size: W * H * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const readback = device.createBuffer({ size: W * H * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    // Traces `tlas` into `image` and copies it to `readback`, in `encoder`.
+    const trace = (encoder, tlas) => {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, device.createBindGroup({ layout, entries: [
+        { binding: 0, resource: tlas }, { binding: 1, resource: { buffer: image } }] }));
+      pass.dispatchWorkgroups(W / 8, H / 8);
+      pass.end();
+      encoder.copyBufferToBuffer(image, 0, readback, 0, W * H * 4);
+    };
+    const read = async () => {
+      await readback.mapAsync(GPUMapMode.READ);
+      const pixels = new Uint32Array(readback.getMappedRange().slice(0));
+      readback.unmap();
+      return pixels;
+    };
+    const run = async (name, record) => {
+      device.pushErrorScope("validation");
+      const encoder = device.createCommandEncoder();
+      await record(encoder);
+      device.queue.submit([encoder.finish()]);
+      const error = await device.popErrorScope();
+      if (error) log(`${name} validation error: ${error.message}`);
+      return !error;
+    };
+
+    // ---- 1. Partitioned TLAS over an ordinary BLAS.
+    const quadVertices = upload(new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0]));
+    const quadIndices = upload(new Uint32Array([0, 1, 2, 0, 2, 3]));
+    const blas = device.createBlas({ geometries: [{ vertexCount: 4, indexFormat: "uint32", indexCount: 6 }] });
+    const tlas = device.createTlas({ maxInstances: 4, partitioned: { partitionCount: 2, maxInstancePerPartitionCount: 2 } });
+    const instanceArgs = buffer(4 * INSTANCE_SIZE), updateArgs = buffer(INSTANCE_SIZE);
+    const commands = buffer(24), updateCommands = buffer(24), one = upload(new Uint32Array([1]));
+    const [blasAddress, instanceAddress, updateAddress] = await addresses([blas, instanceArgs, updateArgs]);
+    log(`addresses: BLAS 0x${blasAddress.toString(16)}, instance records 0x${instanceAddress.toString(16)}`);
+
+    const quads = [];
+    let view = new DataView(new ArrayBuffer(4 * INSTANCE_SIZE));
+    for (let i = 0; i < 4; i++) {
+      const cx = -3 + 2 * i, id = 10 + i;
+      writeInstance(view, i * INSTANCE_SIZE, { cx, id, index: i, partition: i >> 1, address: blasAddress });
+      quads.push({ x0: cx - 0.5, x1: cx + 0.5, y0: -0.5, y1: 0.5, id });
+    }
+    device.queue.writeBuffer(instanceArgs, 0, view.buffer);
+    view = new DataView(new ArrayBuffer(24));
+    writeCommand(view, 0, 0, 4, instanceAddress, INSTANCE_SIZE); // WRITE_INSTANCE x4
+    device.queue.writeBuffer(commands, 0, view.buffer);
+
+    let ok = await run("partitioned", (encoder) => {
+      encoder.buildAccelerationStructures([{ blas, geometries: [{ vertexBuffer: quadVertices, vertexStride: 12, indexBuffer: quadIndices }] }], []);
+      encoder.buildPartitionedAccelerationStructure({ tlas, srcInfos: { buffer: commands, stride: 24 }, srcInfosCount: { buffer: one } });
+      trace(encoder, tlas);
+    });
+    ok = check("partitioned TLAS", await read(), (x, y) => quadValue(x, y, quads)) && ok;
+    log(`${partitionedName} ${ok ? "PASS" : "FAIL"} (build)`);
+
+    // ---- 2. In-place update: instance 3 moves from x = 3 to x = 2.5 and becomes ID 20.
+    view = new DataView(new ArrayBuffer(INSTANCE_SIZE));
+    writeInstance(view, 0, { cx: 2.5, id: 20, index: 3, partition: 1, address: blasAddress });
+    device.queue.writeBuffer(updateArgs, 0, view.buffer);
+    view = new DataView(new ArrayBuffer(24));
+    writeCommand(view, 0, 0, 1, updateAddress, INSTANCE_SIZE);
+    device.queue.writeBuffer(updateCommands, 0, view.buffer);
+    const moved = [...quads.slice(0, 3), { x0: 2, x1: 3, y0: -0.5, y1: 0.5, id: 20 }];
+    let okUpdate = await run("update", (encoder) => {
+      encoder.buildPartitionedAccelerationStructure({ tlas, update: true, srcInfos: { buffer: updateCommands, stride: 24 }, srcInfosCount: { buffer: one } });
+      trace(encoder, tlas);
+    });
+    okUpdate = check("updated TLAS", await read(), (x, y) => quadValue(x, y, moved)) && okUpdate;
+    log(`${partitionedName} ${okUpdate ? "PASS" : "FAIL"} (in-place update)`);
+
+    // ---- 3. Clusters -> cluster BLAS -> partitioned TLAS.
+    if (!hasClusters) {
+      log(`${clusterName} SKIP (not offered)`);
+    } else {
+      const CLUSTERS = 4;
+      const clusterInput = {
+        maxAccelerationStructureCount: CLUSTERS, operation: "build-triangle-cluster", mode: "implicit-destinations",
+        vertexFormat: "float32x3", maxClusterTriangleCount: 2, maxClusterVertexCount: 4,
+        maxTotalTriangleCount: 2 * CLUSTERS, maxTotalVertexCount: 4 * CLUSTERS,
+      };
+      const blasInput = {
+        maxAccelerationStructureCount: 1, operation: "build-clusters-bottom-level", mode: "implicit-destinations",
+        maxTotalClusterCount: CLUSTERS, maxClusterCountPerAccelerationStructure: CLUSTERS,
+      };
+      const clusterSizes = [...new BigUint64Array(await device.getClusterAccelerationStructureBuildSizes(clusterInput))];
+      const blasSizes = [...new BigUint64Array(await device.getClusterAccelerationStructureBuildSizes(blasInput))];
+      log(`cluster build sizes (data, update scratch, build scratch): ${clusterSizes.join(", ")}; cluster BLAS: ${blasSizes.join(", ")}`);
+
+      // Four quads in a row across x in [-1, 1], each its own cluster with a 0.1 gap between.
+      const vertices = [], localQuads = [];
+      for (let k = 0; k < CLUSTERS; k++) {
+        const x0 = -1 + k * 0.5 + 0.05, x1 = -1 + (k + 1) * 0.5 - 0.05, y0 = -0.45, y1 = 0.45;
+        vertices.push(x0, y0, 0, x1, y0, 0, x1, y1, 0, x0, y1, 0);
+        localQuads.push({ x0, x1, y0, y1 });
+      }
+      const clusterVertices = upload(new Float32Array(vertices));
+      const clusterIndices = upload(new Uint8Array([0, 1, 2, 0, 2, 3, 0, 0]));
+      const triangleInfos = buffer(64 * CLUSTERS), clusterData = buffer(Number(clusterSizes[0]));
+      const clusterAddresses = buffer(8 * CLUSTERS), clusterByteSizes = buffer(4 * CLUSTERS);
+      const blasInfos = buffer(16), blasData = buffer(Number(blasSizes[0])), clusterBlasAddress = buffer(8);
+      const clusterInstanceArgs = buffer(2 * INSTANCE_SIZE), clusterCommands = buffer(24);
+      const four = upload(new Uint32Array([CLUSTERS]));
+      const clusterTlas = device.createTlas({ maxInstances: 2, partitioned: { partitionCount: 1, maxInstancePerPartitionCount: 2 } });
+      const [vertexAddress, indexAddress, clusterAddressesAddress, clusterInstanceAddress] =
+        await addresses([clusterVertices, clusterIndices, clusterAddresses, clusterInstanceArgs]);
+
+      // VkClusterAccelerationStructureBuildTriangleClusterInfoNV: 64 bytes.
+      view = new DataView(new ArrayBuffer(64 * CLUSTERS));
+      for (let k = 0; k < CLUSTERS; k++) {
+        const o = 64 * k;
+        view.setUint32(o, k, true);                                  // clusterID
+        view.setUint32(o + 4, 0, true);                              // clusterFlags
+        view.setUint32(o + 8, 2 | (4 << 9) | (0 << 18) | (1 << 24), true); // 2 triangles, 4 vertices, 8-bit indices
+        view.setUint32(o + 12, 4 << 29, true);                       // geometry 0, OPAQUE
+        view.setUint16(o + 16, 1, true);                             // index stride
+        view.setUint16(o + 18, 12, true);                            // vertex stride
+        view.setBigUint64(o + 24, indexAddress, true);
+        view.setBigUint64(o + 32, vertexAddress + BigInt(48 * k), true);
+      }
+      device.queue.writeBuffer(triangleInfos, 0, view.buffer);
+      // VkClusterAccelerationStructureBuildClustersBottomLevelInfoNV: count, stride, address of cluster addresses.
+      view = new DataView(new ArrayBuffer(16));
+      view.setUint32(0, CLUSTERS, true);
+      view.setUint32(4, 8, true);
+      view.setBigUint64(8, clusterAddressesAddress, true);
+      device.queue.writeBuffer(blasInfos, 0, view.buffer);
+      // Two instances of the cluster BLAS; its address is copied in on the GPU.
+      const clusterQuads = [];
+      view = new DataView(new ArrayBuffer(2 * INSTANCE_SIZE));
+      [-2, 2].forEach((cx, i) => {
+        writeInstance(view, i * INSTANCE_SIZE, { cx, id: 30 + i, index: i, partition: 0, address: 0n });
+        for (const q of localQuads) clusterQuads.push({ x0: q.x0 + cx, x1: q.x1 + cx, y0: q.y0, y1: q.y1, id: 30 + i });
+      });
+      device.queue.writeBuffer(clusterInstanceArgs, 0, view.buffer);
+      view = new DataView(new ArrayBuffer(24));
+      writeCommand(view, 0, 0, 2, clusterInstanceAddress, INSTANCE_SIZE);
+      device.queue.writeBuffer(clusterCommands, 0, view.buffer);
+
+      const info = device.createBuffer({ size: 8 * CLUSTERS + 4 * CLUSTERS + 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      let okClusters = await run("clusters", (encoder) => {
+        encoder.buildClusterAccelerationStructuresIndirect({
+          ...clusterInput,
+          dstImplicitData: { buffer: clusterData },
+          dstAddresses: { buffer: clusterAddresses, stride: 8 },
+          dstSizes: { buffer: clusterByteSizes, stride: 4 },
+          srcInfos: { buffer: triangleInfos, stride: 64 },
+          srcInfosCount: { buffer: four },
+        });
+        encoder.buildClusterAccelerationStructuresIndirect({
+          ...blasInput,
+          dstImplicitData: { buffer: blasData },
+          dstAddresses: { buffer: clusterBlasAddress, stride: 8 },
+          srcInfos: { buffer: blasInfos, stride: 16 },
+          srcInfosCount: { buffer: one },
+        });
+        encoder.copyBufferToBuffer(clusterBlasAddress, 0, clusterInstanceArgs, 96, 8);
+        encoder.copyBufferToBuffer(clusterBlasAddress, 0, clusterInstanceArgs, INSTANCE_SIZE + 96, 8);
+        encoder.buildPartitionedAccelerationStructure({ tlas: clusterTlas, srcInfos: { buffer: clusterCommands, stride: 24 }, srcInfosCount: { buffer: one } });
+        trace(encoder, clusterTlas);
+        encoder.copyBufferToBuffer(clusterAddresses, 0, info, 0, 8 * CLUSTERS);
+        encoder.copyBufferToBuffer(clusterByteSizes, 0, info, 8 * CLUSTERS, 4 * CLUSTERS);
+        encoder.copyBufferToBuffer(clusterBlasAddress, 0, info, 12 * CLUSTERS, 8);
+      });
+      okClusters = check("cluster TLAS", await read(), (x, y) => quadValue(x, y, clusterQuads)) && okClusters;
+      await info.mapAsync(GPUMapMode.READ);
+      const infoBytes = info.getMappedRange().slice(0);
+      info.unmap();
+      const written = new BigUint64Array(infoBytes, 0, CLUSTERS), sizes = new Uint32Array(infoBytes, 8 * CLUSTERS, CLUSTERS);
+      const writtenBlas = new BigUint64Array(infoBytes, 12 * CLUSTERS, 1)[0];
+      log(`GPU-written cluster addresses: ${[...written].map((a) => "0x" + a.toString(16)).join(" ")}; sizes: ${[...sizes].join(" ")} bytes; cluster BLAS 0x${writtenBlas.toString(16)}`);
+      log(`${clusterName} ${okClusters ? "PASS" : "FAIL"} (clusters, cluster BLAS, partitioned TLAS)`);
+    }
+    draw();
+    log("DONE");
+  }
+} catch (e) {
+  log(`ERROR ${e?.message ?? e}`);
+  log("DONE");
+}
+</script>

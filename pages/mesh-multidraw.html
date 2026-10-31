@@ -1,0 +1,189 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mesh shaders, multi-draw and immediates test</title>
+<style>body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; } pre { white-space: pre-wrap; }</style>
+<h1>Mesh shaders, multi-draw and immediates test</h1>
+<p>Mesh shader: a task shader launches one mesh workgroup, which outputs a triangle covering the left half.
+Multi-draw with count: four indirect draws are recorded, but a count buffer written on the GPU says to run only
+two. Immediates: a compute shader reads <code>var&lt;immediate&gt;</code> data set with <code>setImmediates</code>.
+Results are also printed as <code>MESH ...</code> lines.</p>
+<pre id="out"></pre>
+<script type="module">
+const out = document.getElementById("out");
+const log = (line) => { out.textContent += line + "\n"; console.log("MESH " + line); };
+const SIZE = 32;
+
+async function readTexture(device, texture) {
+  const buffer = device.createBuffer({ size: 256 * SIZE, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const encoder = device.createCommandEncoder();
+  encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [SIZE, SIZE]);
+  device.queue.submit([encoder.finish()]);
+  await buffer.mapAsync(GPUMapMode.READ);
+  const bytes = new Uint8Array(buffer.getMappedRange().slice(0));
+  buffer.unmap();
+  return (x, y) => bytes.slice(y * 256 + x * 4, y * 256 + x * 4 + 4);
+}
+
+function target(device) {
+  return device.createTexture({ size: [SIZE, SIZE], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+}
+
+async function meshShader(device) {
+  const module = device.createShaderModule({ code: `
+enable wgpu_mesh_shader;
+// Two members: DXC rejects a one-member payload struct ("Bitcast on struct types is not allowed").
+struct Payload { tint: vec4<f32>, unused: f32 }
+var<task_payload> payload: Payload;
+struct Vertex { @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32> }
+struct Primitive { @builtin(triangle_indices) indices: vec3<u32> }
+struct Output {
+  @builtin(vertices) vertices: array<Vertex, 3>,
+  @builtin(primitives) primitives: array<Primitive, 1>,
+  @builtin(vertex_count) vertex_count: u32,
+  @builtin(primitive_count) primitive_count: u32,
+}
+var<workgroup> output: Output;
+
+@task @payload(payload) @workgroup_size(1)
+fn task() -> @builtin(mesh_task_size) vec3<u32> {
+  payload.tint = vec4(1.0, 0.5, 0.0, 1.0);
+  return vec3(1, 1, 1);
+}
+
+@mesh(output) @payload(payload) @workgroup_size(1)
+fn mesh() {
+  output.vertex_count = 3;
+  output.primitive_count = 1;
+  // Covers x < 0 (the left half) entirely.
+  output.vertices[0].position = vec4(-1.0, -3.0, 0.0, 1.0);
+  output.vertices[1].position = vec4(-1.0, 3.0, 0.0, 1.0);
+  output.vertices[2].position = vec4(0.0, 0.0, 0.0, 1.0) + vec4(0.0, 0.0, 0.0, 0.0);
+  output.vertices[0].color = payload.tint;
+  output.vertices[1].color = payload.tint;
+  output.vertices[2].color = payload.tint;
+  output.primitives[0].indices = vec3<u32>(0, 1, 2);
+}
+
+@fragment fn fragment(input: Vertex) -> @location(0) vec4<f32> { return input.color; }
+` });
+  const info = await module.getCompilationInfo();
+  for (const m of info.messages) log(`mesh shader ${m.type}: ${m.message}`);
+  device.pushErrorScope("validation");
+  const pipeline = device.createMeshPipeline({
+    layout: "auto",
+    task: { module, entryPoint: "task" },
+    mesh: { module, entryPoint: "mesh" },
+    fragment: { module, entryPoint: "fragment", targets: [{ format: "rgba8unorm" }] },
+  });
+  const texture = target(device);
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 1, 1] }] });
+  pass.setPipeline(pipeline);
+  pass.drawMeshTasks(1);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  const error = await device.popErrorScope();
+  if (error) { log(`mesh shader FAIL: ${error.message}`); return; }
+  const at = await readTexture(device, texture);
+  // The triangle (-1,-3) (-1,3) (0,0) covers the left edge's middle; check a pixel inside and one outside.
+  const inside = at(2, SIZE / 2), outside = at(SIZE - 2, SIZE / 2);
+  const ok = inside[0] === 255 && inside[1] >= 127 && inside[1] <= 128 && inside[2] === 0 && outside[2] === 255;
+  log(`mesh shader ${ok ? "PASS" : "FAIL"}: inside ${inside.join(",")}, outside ${outside.join(",")}`);
+}
+
+async function multiDrawCount(device, byInstance) {
+  const module = device.createShaderModule({ code: `const BY_INSTANCE = ${byInstance};
+@vertex fn vertex(@builtin(vertex_index) v: u32, @builtin(instance_index) instance: u32) -> @builtin(position) vec4<f32> {
+  // Draw i fills column band i (of 4) with a full-height quad made of 6 vertices. The band comes from
+  // firstVertex (vertex_index / 6), or from firstInstance in the instance-index check.
+  let corners = array(vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(1.0, 1.0));
+  let c = corners[v % 6u];
+  let i = select(v / 6u, instance, BY_INSTANCE);
+  return vec4((f32(i) + c.x) * 0.5 - 1.0, c.y * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fragment() -> @location(0) vec4<f32> { return vec4(0.0, 1.0, 0.0, 1.0); }
+@group(0) @binding(0) var<storage, read_write> count: array<u32>;
+@compute @workgroup_size(1) fn setCount() { count[0] = 2u; }
+` });
+  device.pushErrorScope("validation");
+  const pipeline = device.createRenderPipeline({ layout: "auto", vertex: { module, entryPoint: "vertex" }, fragment: { module, entryPoint: "fragment", targets: [{ format: "rgba8unorm" }] } });
+  const countPipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "setCount" } });
+  // Four draws: (vertexCount 6, instanceCount 1, firstVertex, firstInstance).
+  const args = byInstance
+    ? new Uint32Array([6, 1, 0, 0, 6, 1, 0, 1, 6, 1, 0, 2, 6, 1, 0, 3])
+    : new Uint32Array([6, 1, 0, 0, 6, 1, 6, 0, 6, 1, 12, 0, 6, 1, 18, 0]);
+  const indirect = device.createBuffer({ size: args.byteLength, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(indirect, 0, args);
+  const countBuffer = device.createBuffer({ size: 16, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE });
+  const group = device.createBindGroup({ layout: countPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: countBuffer } }] });
+  const texture = target(device);
+  const encoder = device.createCommandEncoder();
+  const compute = encoder.beginComputePass();
+  compute.setPipeline(countPipeline);
+  compute.setBindGroup(0, group);
+  compute.dispatchWorkgroups(1);
+  compute.end();
+  const pass = encoder.beginRenderPass({ colorAttachments: [{ view: texture.createView(), loadOp: "clear", storeOp: "store", clearValue: [0, 0, 0, 1] }] });
+  pass.setPipeline(pipeline);
+  pass.multiDrawIndirectCount(indirect, 0, countBuffer, 0, 4);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  const error = await device.popErrorScope();
+  if (error) { log(`multi-draw count FAIL: ${error.message}`); return; }
+  const at = await readTexture(device, texture);
+  const bands = [0, 1, 2, 3].map((b) => at(b * (SIZE / 4) + 2, SIZE / 2)[1] === 255 ? "drawn" : "empty");
+  const ok = bands.join() === "drawn,drawn,empty,empty";
+  log(`multi-draw indirect count${byInstance ? " (bands by firstInstance)" : ""} ${ok ? "PASS" : "FAIL"}: bands ${bands.join(", ")} (GPU-written count 2 of max 4)`);
+}
+
+async function immediates(device) {
+  const module = device.createShaderModule({ code: `
+struct Data { a: u32, b: u32, c: u32, d: u32 }
+var<immediate> data: Data;
+@group(0) @binding(0) var<storage, read_write> result: array<u32>;
+@compute @workgroup_size(1) fn main() { result[0] = data.a + data.b * 10u + data.c * 100u + data.d * 1000u; }
+` });
+  const info = await module.getCompilationInfo();
+  for (const m of info.messages) log(`immediates shader ${m.type}: ${m.message}`);
+  device.pushErrorScope("validation");
+  const layout = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } }] });
+  const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout], immediateSize: 16 }), compute: { module, entryPoint: "main" } });
+  const result = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const readback = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout, entries: [{ binding: 0, resource: { buffer: result } }] }));
+  pass.setImmediates(0, new Uint32Array([4, 3, 2, 1]));
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  encoder.copyBufferToBuffer(result, 0, readback, 0, 16);
+  device.queue.submit([encoder.finish()]);
+  const error = await device.popErrorScope();
+  if (error) { log(`immediates FAIL: ${error.message}`); return; }
+  await readback.mapAsync(GPUMapMode.READ);
+  const value = new Uint32Array(readback.getMappedRange())[0];
+  readback.unmap();
+  log(`immediates ${value === 1234 ? "PASS" : "FAIL"}: shader read ${value} (expected 1234)`);
+}
+
+try {
+  const adapter = await navigator.gpu.requestAdapter();
+  // indirect-first-instance: without it WebGPU turns indirect draws with a non-zero firstInstance into no-ops.
+  const wanted = ["wgpu-mesh-shader", "wgpu-multi-draw-indirect-count", "immediates", "indirect-first-instance"];
+  const offered = wanted.filter((f) => adapter.features.has(f));
+  log(`offered: ${offered.join(", ") || "none"}`);
+  const device = await adapter.requestDevice({ requiredFeatures: offered });
+  device.addEventListener("uncapturederror", (e) => log(`uncaptured error: ${e.error.message}`));
+  if (device.features.has("wgpu-mesh-shader")) await meshShader(device); else log("mesh shader SKIP");
+  if (device.features.has("wgpu-multi-draw-indirect-count")) {
+    await multiDrawCount(device, false);
+    await multiDrawCount(device, true);
+  } else log("multi-draw count SKIP");
+  if (device.features.has("immediates")) await immediates(device); else log("immediates SKIP");
+  log("DONE");
+} catch (error) {
+  log(`ERROR ${error?.message ?? error}`);
+  log("DONE");
+}
+</script>
