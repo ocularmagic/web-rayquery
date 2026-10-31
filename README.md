@@ -11,7 +11,7 @@ Background: [gpuweb#535](https://github.com/gpuweb/gpuweb/issues/535) (ray traci
 | 0 | Check wgpu/Firefox support; run wgpu ray queries natively | Done |
 | 1 | Build Firefox unmodified | Done |
 | 2 | Pref-gated ray query API in Firefox (WebIDL, dom/webgpu, IPC, wgpu_bindings) | Done (Windows, DX12) |
-| 3 | Test page (plain WebGPU) tracing rays vs a software result | Not started |
+| 3 | Test page (plain WebGPU) tracing rays vs a software result | Done |
 | 4 | Write-up | Maybe |
 
 ## Phase 0 findings (October 2026)
@@ -90,6 +90,44 @@ On the RTX 5070 (Windows 11, DX12), with [`pages/rayquery-smoke.html`](pages/ray
 - Turning the pref on drops strict WebGPU compliance for every page, not just ones using ray queries. Known effects: an adapter can create more than one device, and wgpu's extra `max_buffers_and_acceleration_structures_per_shader_stage` limit (28 by default) applies.
 - Not hardened. wgpu marks ray queries as experimental, and this exposes them to web content. Keep the pref off for normal browsing.
 - Not tested: the Vulkan backend (basic WebGPU already fails there, see Phase 1), Linux, macOS, workers, Firefox's own test suites or the WebGPU CTS, and performance. Rust changes were not run through rustfmt.
+
+## Phase 3: boxes compared with software (October 2026)
+
+[`pages/rayquery-boxes.html`](pages/rayquery-boxes.html) traces one scene three ways and compares them pixel by pixel:
+
+1. **Hardware** ray queries through the Phase 2 API (skipped when the browser doesn't offer `experimental-ray-query`).
+2. **Software on the GPU:** a plain WebGPU compute shader that tests every triangle (brute force, no acceleration structure). This is the kind of fallback a page would use in normal browsers.
+3. **CPU reference** in 64-bit JavaScript.
+
+The scene has a ground slab, 12 boxes (indexed `uint16` cube BLAS, instanced with rotations and non-uniform scales) and two "T" shapes (a second BLAS with two non-indexed geometries in one vertex buffer, the second at `firstVertex: 36`). That is 15 TLAS instances and 204 triangles. Each of the 320x200 pixels gets a primary ray and a shadow ray towards a directional light. For every pixel the page compares hit or miss, instance custom data and index, geometry index, primitive index, distance, barycentrics, front face and shadow. Rays that pass within 1e-4 (barycentric) of a triangle edge are counted separately, because rounding can legitimately change their answer.
+
+![Hardware, software and CPU renders, and the difference map](images/rayquery-boxes.png)
+
+*Top left: hardware ray queries. Top right: software compute shader. Bottom left: CPU reference. Bottom right: differences (all grey = every pixel agrees).*
+
+Results in the patched Firefox on the RTX 5070 (DX12):
+
+| | Hardware vs CPU | Software vs CPU |
+|---|---|---|
+| Rays (primary, plus a shadow ray per hit) | 64,000 (40,250 hits) | 64,000 (40,250 hits) |
+| Mismatches | 0 | 0 |
+| Edge-grazing rays that differ | 0 of 5,834 | 0 of 5,834 |
+| Max hit distance error | 1.3e-5 m | 1.3e-5 m |
+| Max barycentric error | 1.1e-5 | 1.3e-5 |
+| Front-face disagreements | 0 | 0 |
+
+With the pref off, the same page skips the hardware path and the software tracer still matches the CPU (0 mismatches).
+
+### Timing (rough)
+
+A second scene with 401 instances (4,812 triangles) at 640x400, primary plus shadow rays, measured with GPU timestamp queries (median of 5):
+
+| | GPU time per frame |
+|---|---|
+| Software, brute force | 14.3 to 17.5 ms |
+| Hardware ray queries | 0.030 to 0.041 ms |
+
+Ranges cover four runs. That is roughly 350x to 580x, or 9 to 12 billion rays per second on this scene. The hardware result for this scene matched the software one except on 36 of 256,000 rays (edge cases). Caveats: brute force is a weak baseline (a software tracer with a BVH would be much faster), the scene is tiny and coherent, and timings varied run to run. Wall-clock time is no use here: in this Firefox build `onSubmittedWorkDone` resolved on a ~100 ms cycle.
 
 ## wgpu-rq-test
 

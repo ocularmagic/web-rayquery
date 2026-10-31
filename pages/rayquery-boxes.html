@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ray query boxes</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #5c5c5c; --line: #d8d8d8; --ok: #1b7f3b; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161616; --fg: #e8e8e8; --muted: #a0a0a0; --line: #333; --ok: #6ccf8e; --bad: #f2827a; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 1.4em; margin: 0 0 4px; }
+  p { margin: 4px 0 12px; max-width: 70ch; }
+  .muted { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 12px; margin: 12px 0; }
+  figure { margin: 0; }
+  figcaption { font-size: 0.9em; color: var(--muted); }
+  canvas { width: 100%; height: auto; image-rendering: pixelated; border: 1px solid var(--line); background: #000; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.45 ui-monospace, Consolas, monospace; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+</style>
+</head>
+<body>
+<h1>Ray query boxes</h1>
+<p>A scene of boxes traced three ways: hardware ray queries (needs the web-rayquery Firefox patch and
+<code>dom.webgpu.experimental-ray-query.enabled</code>), a brute-force software tracer in a plain WebGPU
+compute shader, and a 64-bit JavaScript reference. Each pixel gets a primary ray and a shadow ray towards the light.</p>
+<p id="status">Running...</p>
+<div class="grid">
+  <figure><canvas id="c-hw" width="320" height="200"></canvas><figcaption>Hardware ray queries</figcaption></figure>
+  <figure><canvas id="c-sw" width="320" height="200"></canvas><figcaption>Software (WebGPU compute, brute force)</figcaption></figure>
+  <figure><canvas id="c-cpu" width="320" height="200"></canvas><figcaption>CPU reference (JavaScript, 64-bit)</figcaption></figure>
+  <figure><canvas id="c-diff" width="320" height="200"></canvas><figcaption>Differences: red = real mismatch, amber = differs on a ray that grazes an edge, grey = agrees</figcaption></figure>
+</div>
+<pre id="out"></pre>
+<script type="module">
+// Phase 3 of web-rayquery. Lines are also logged with a "RAYQUERY-BOXES" prefix so
+// a terminal can read them (Firefox: devtools.console.stdout.content=true).
+// Units are metres.
+const out = document.getElementById('out');
+const status = document.getElementById('status');
+const log = (line) => { out.textContent += line + '\n'; console.log('RAYQUERY-BOXES ' + line); };
+const finish = (ok, msg) => {
+  status.textContent = msg;
+  status.className = ok ? 'ok' : 'bad';
+  log('RESULT ' + (ok ? 'PASS' : 'FAIL') + ' ' + msg);
+};
+
+// ---------------------------------------------------------------- maths
+
+const f32 = Math.fround;
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const scale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const normalize = (a) => scale(a, 1 / Math.hypot(a[0], a[1], a[2]));
+const rad = (deg) => deg * Math.PI / 180;
+
+// Row-major 3x4 object-to-world matrix: translate * rotY * rotX * scale, rounded to
+// float32 because that is what the TLAS gets. Every tracer uses these values.
+function transform(t, s, rotYDeg = 0, rotXDeg = 0) {
+  const cy = Math.cos(rad(rotYDeg)), sy = Math.sin(rad(rotYDeg));
+  const cx = Math.cos(rad(rotXDeg)), sx = Math.sin(rad(rotXDeg));
+  const r = [[cy, sy * sx, sy * cx], [0, cx, -sx], [-sy, cy * sx, cy * cx]];
+  const m = [];
+  for (let i = 0; i < 3; i++) m.push(r[i][0] * s[0], r[i][1] * s[1], r[i][2] * s[2], t[i]);
+  return m.map(f32);
+}
+const apply = (m, v) => [
+  m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3],
+  m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7],
+  m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11],
+];
+
+// ---------------------------------------------------------------- geometry
+
+// Unit cube, indexed, triangles counter-clockwise seen from outside.
+const CUBE_VERTS = [[-.5, -.5, -.5], [.5, -.5, -.5], [.5, .5, -.5], [-.5, .5, -.5],
+                    [-.5, -.5, .5], [.5, -.5, .5], [.5, .5, .5], [-.5, .5, .5]];
+const CUBE_INDICES = [4, 5, 6, 4, 6, 7,  1, 0, 3, 1, 3, 2,  5, 1, 2, 5, 2, 6,
+                      0, 4, 7, 0, 7, 3,  7, 6, 2, 7, 2, 3,  0, 1, 5, 0, 5, 4];
+for (let i = 0; i < CUBE_INDICES.length; i += 3) {  // check the winding once
+  const [a, b, c] = [0, 1, 2].map((k) => CUBE_VERTS[CUBE_INDICES[i + k]]);
+  if (dot(cross(sub(b, a), sub(c, a)), add(add(a, b), c)) <= 0) throw new Error('cube triangle ' + i / 3 + ' faces inwards');
+}
+
+// A non-indexed box (36 vertices) centred at `c` with size `s`.
+const boxVerts = (c, s) => CUBE_INDICES.map((i) => CUBE_VERTS[i].map((v, k) => f32(c[k] + v * s[k])));
+
+// BLAS 0: the indexed cube (one geometry).
+// BLAS 1: a "T" made of two non-indexed boxes in one vertex buffer (two geometries).
+const T_GEOMETRIES = [boxVerts([0, 1.0, 0], [0.4, 2.0, 0.4]), boxVerts([0, 2.15, 0], [1.6, 0.2, 0.6])];
+// objectTriangles[blas][geometry][primitive] = [a, b, c] in object space.
+const objectTriangles = [
+  [Array.from({ length: CUBE_INDICES.length / 3 }, (_, p) => [0, 1, 2].map((k) => CUBE_VERTS[CUBE_INDICES[p * 3 + k]]))],
+  T_GEOMETRIES.map((verts) => Array.from({ length: verts.length / 3 }, (_, p) => [verts[p * 3], verts[p * 3 + 1], verts[p * 3 + 2]])),
+];
+
+// Instances: { blas, m (3x4), id (customData) }.
+function mainScene() {
+  const inst = [];
+  inst.push({ blas: 0, m: transform([0, -0.1, 0], [14, 0.2, 14]) });  // ground, top at y = 0
+  const cubes = [  // x, z, size x/y/z, rotY, rotX (degrees)
+    [-3.0, -2.0, 1.2, 1.2, 1.2, 20, 0], [-1.2, -3.2, 0.8, 1.8, 0.8, 45, 0], [1.5, -2.5, 1.6, 0.6, 1.0, -15, 0],
+    [3.2, -0.8, 1.0, 1.0, 1.0, 30, 25], [2.4, 1.6, 0.7, 0.7, 0.7, 10, 40], [0.4, 2.8, 1.4, 1.0, 0.6, 70, 0],
+    [-2.2, 2.0, 0.9, 2.4, 0.9, -30, 0], [-3.6, 0.4, 0.6, 0.6, 0.6, 15, 35], [0.0, 0.0, 1.0, 1.0, 1.0, 0, 0],
+    [4.2, 3.4, 1.2, 0.5, 1.2, 60, 0], [-0.8, -0.9, 0.5, 0.5, 0.5, 35, 50], [1.6, 0.2, 0.5, 2.8, 0.5, 5, 0],
+  ];
+  for (const [x, z, sx, sy, sz, ry, rx] of cubes) {
+    const halfY = 0.5 * (sy * Math.abs(Math.cos(rad(rx))) + sz * Math.abs(Math.sin(rad(rx))));
+    inst.push({ blas: 0, m: transform([x, halfY + 0.01, z], [sx, sy, sz], ry, rx) });
+  }
+  inst.push({ blas: 1, m: transform([-1.0, 0.01, 4.2], [1, 1, 1], 20) });
+  inst.push({ blas: 1, m: transform([3.8, 0.01, -3.4], [1, 1, 1], -40) });
+  inst.forEach((it, i) => { it.id = 100 + i; });
+  return { instances: inst, camera: { eye: [6.5, 5, 8], target: [0, 0.7, 0], fovY: 42 }, width: 320, height: 200 };
+}
+
+// A larger scene for timing: a 20 x 20 grid of cubes.
+function timingScene() {
+  const inst = [{ blas: 0, m: transform([0, -0.1, 0], [16, 0.2, 16]) }];
+  let seed = 12345;
+  const rand = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+  for (let i = 0; i < 20; i++) for (let j = 0; j < 20; j++) {
+    const h = 0.2 + rand() * 0.8;
+    inst.push({ blas: 0, m: transform([(i - 9.5) * 0.7, h / 2 + 0.01, (j - 9.5) * 0.7], [0.4, h, 0.4], rand() * 90) });
+  }
+  inst.forEach((it, i) => { it.id = 100 + i; });
+  return { instances: inst, camera: { eye: [10, 9, 12], target: [0, 0, 0], fovY: 45 }, width: 640, height: 400 };
+}
+
+// World-space triangles (64-bit), shared by the software tracer and the CPU reference.
+function worldTriangles(scene) {
+  const tris = [];
+  scene.instances.forEach((it, instanceIndex) => {
+    objectTriangles[it.blas].forEach((geometry, geometryIndex) => {
+      geometry.forEach((tri, primitiveIndex) => {
+        tris.push({ a: apply(it.m, tri[0]), b: apply(it.m, tri[1]), c: apply(it.m, tri[2]),
+                    id: it.id, instanceIndex, geometryIndex, primitiveIndex });
+      });
+    });
+  });
+  return tris;
+}
+
+// One float32 ray per pixel: origin, tmin, direction, tmax.
+const TMIN = 1e-3, TMAX = 1e4, SHADOW_TMIN = 1e-3;
+const LIGHT = normalize([-0.5, 1.0, 0.35]).map(f32);
+function cameraRays(scene) {
+  const { eye, target, fovY } = scene.camera, W = scene.width, H = scene.height;
+  const fwd = normalize(sub(target, eye)), right = normalize(cross(fwd, [0, 1, 0])), up = cross(right, fwd);
+  const k = Math.tan(rad(fovY) / 2);
+  const rays = new Float32Array(W * H * 8);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const sx = ((x + 0.5) / W * 2 - 1) * k * W / H, sy = (1 - (y + 0.5) / H * 2) * k;
+    const d = normalize(add(add(fwd, scale(right, sx)), scale(up, sy)));
+    rays.set([eye[0], eye[1], eye[2], TMIN, d[0], d[1], d[2], TMAX], (y * W + x) * 8);
+  }
+  return rays;
+}
+
+// ---------------------------------------------------------------- CPU reference
+
+const EDGE_EPS = 1e-4;  // barycentric distance from an edge that counts as grazing
+// Closest hit (or any hit for shadows) by brute force, plus whether the result is
+// ambiguous: the ray passes within EDGE_EPS of an edge of a triangle that could
+// change the answer, or two different triangles are hit at almost the same t.
+function cpuTrace(tris, o, d, tmin, tmax, anyHit) {
+  let best = null, second = Infinity, nearT = Infinity, clearHit = false;
+  for (let i = 0; i < tris.length; i++) {
+    const tr = tris[i];
+    const e1 = sub(tr.b, tr.a), e2 = sub(tr.c, tr.a), p = cross(d, e2), det = dot(e1, p);
+    if (Math.abs(det) < 1e-14) continue;
+    const inv = 1 / det, s = sub(o, tr.a), u = dot(s, p) * inv, q = cross(s, e1), v = dot(d, q) * inv;
+    const t = dot(e2, q) * inv, m = Math.min(u, v, 1 - u - v);
+    if (t >= tmax || t < tmin - 1e-3) continue;
+    const grazing = Math.abs(m) < EDGE_EPS || Math.abs(t - tmin) < 1e-3;
+    if (m > -EDGE_EPS && grazing) nearT = Math.min(nearT, t);
+    if (m < 0 || t <= tmin) continue;
+    if (!grazing) clearHit = true;
+    if (!best || t < best.t) { if (best) second = best.t; best = { t, u, v, det, tri: i }; }
+    else second = Math.min(second, t);
+  }
+  let ambiguous;
+  if (anyHit) {
+    // A shadow ray is only in doubt if every hit it has is a grazing one.
+    ambiguous = nearT !== Infinity && !clearHit;
+  } else {
+    ambiguous = (best ? nearT <= best.t + 1e-3 : nearT !== Infinity) ||
+                (!!best && second - best.t < 1e-4 * Math.max(1, best.t));
+  }
+  return { best, ambiguous };
+}
+
+// ---------------------------------------------------------------- GPU tracers
+
+// Hit record (48 bytes), same layout for both tracers.
+const HIT_WORDS = 12;
+const HIT_STRUCT = `
+struct Params { ray_count: u32, tri_count: u32, shadow_tmin: f32, _pad: f32, light: vec4f }
+struct Ray { origin: vec3f, tmin: f32, dir: vec3f, tmax: f32 }
+struct Hit { kind: u32, t: f32, bary: vec2f, instance_id: u32, instance_index: u32,
+             geometry_index: u32, primitive_index: u32, front_face: u32, shadow: u32, _p0: u32, _p1: u32 }`;
+
+const HARDWARE_WGSL = `
+enable wgpu_ray_query;
+${HIT_STRUCT}
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> rays: array<Ray>;
+@group(0) @binding(2) var acc: acceleration_structure;
+@group(0) @binding(3) var<storage, read_write> hits: array<Hit>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if gid.x >= params.ray_count { return; }
+  let r = rays[gid.x];
+  var rq: ray_query;
+  rayQueryInitialize(&rq, acc, RayDesc(0u, 0xFFu, r.tmin, r.tmax, r.origin, r.dir));
+  rayQueryProceed(&rq);
+  let i = rayQueryGetCommittedIntersection(&rq);
+  var h: Hit;
+  if i.kind != RAY_QUERY_INTERSECTION_NONE {
+    h.kind = 1u;
+    h.t = i.t;
+    h.bary = i.barycentrics;
+    h.instance_id = i.instance_custom_data;
+    h.instance_index = i.instance_index;
+    h.geometry_index = i.geometry_index;
+    h.primitive_index = i.primitive_index;
+    h.front_face = select(0u, 1u, i.front_face);
+    // Shadow ray; flag 4 = terminate on first hit.
+    var sq: ray_query;
+    rayQueryInitialize(&sq, acc, RayDesc(4u, 0xFFu, params.shadow_tmin, 1e4, r.origin + r.dir * i.t, params.light.xyz));
+    rayQueryProceed(&sq);
+    h.shadow = select(0u, 1u, rayQueryGetCommittedIntersection(&sq).kind != RAY_QUERY_INTERSECTION_NONE);
+  }
+  hits[gid.x] = h;
+}`;
+
+const SOFTWARE_WGSL = `
+${HIT_STRUCT}
+struct Tri { a: vec4f, b: vec4f, c: vec4f, ids: vec4u }  // ids: custom data, instance, geometry, primitive
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> rays: array<Ray>;
+@group(0) @binding(2) var<storage, read> tris: array<Tri>;
+@group(0) @binding(3) var<storage, read_write> hits: array<Hit>;
+
+// Moller-Trumbore: (t, u, v, det), t < 0 for a miss.
+fn intersect(o: vec3f, d: vec3f, tri: Tri, tmin: f32, tmax: f32) -> vec4f {
+  let e1 = tri.b.xyz - tri.a.xyz;
+  let e2 = tri.c.xyz - tri.a.xyz;
+  let p = cross(d, e2);
+  let det = dot(e1, p);
+  if abs(det) < 1e-12 { return vec4f(-1.0); }
+  let inv = 1.0 / det;
+  let s = o - tri.a.xyz;
+  let u = dot(s, p) * inv;
+  if u < 0.0 || u > 1.0 { return vec4f(-1.0); }
+  let q = cross(s, e1);
+  let v = dot(d, q) * inv;
+  if v < 0.0 || u + v > 1.0 { return vec4f(-1.0); }
+  let t = dot(e2, q) * inv;
+  if t <= tmin || t >= tmax { return vec4f(-1.0); }
+  return vec4f(t, u, v, det);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  if gid.x >= params.ray_count { return; }
+  let r = rays[gid.x];
+  var best = vec4f(-1.0);
+  var best_tri = 0u;
+  var tmax = r.tmax;
+  for (var i = 0u; i < params.tri_count; i++) {
+    let h = intersect(r.origin, r.dir, tris[i], r.tmin, tmax);
+    if h.x >= 0.0 { best = h; best_tri = i; tmax = h.x; }
+  }
+  var h: Hit;
+  if best.x >= 0.0 {
+    let tri = tris[best_tri];
+    h.kind = 1u;
+    h.t = best.x;
+    h.bary = best.yz;
+    h.instance_id = tri.ids.x;
+    h.instance_index = tri.ids.y;
+    h.geometry_index = tri.ids.z;
+    h.primitive_index = tri.ids.w;
+    h.front_face = select(0u, 1u, best.w > 0.0);
+    let p = r.origin + r.dir * best.x;
+    for (var i = 0u; i < params.tri_count; i++) {
+      if intersect(p, params.light.xyz, tris[i], params.shadow_tmin, 1e4).x >= 0.0 { h.shadow = 1u; break; }
+    }
+  }
+  hits[gid.x] = h;
+}`;
+
+// ---------------------------------------------------------------- shading and comparison
+
+const PALETTE = [[0.55, 0.55, 0.52], [0.86, 0.42, 0.32], [0.33, 0.6, 0.85], [0.95, 0.75, 0.3], [0.45, 0.75, 0.45],
+                 [0.7, 0.45, 0.8], [0.3, 0.75, 0.75], [0.9, 0.55, 0.65]];
+function shade(hit, ray, triByKey) {
+  if (!hit.kind) {
+    const k = Math.max(0, ray[5]);
+    return [0.55 + 0.3 * k, 0.7 + 0.2 * k, 0.9];
+  }
+  const tri = triByKey.get(hit.instanceIndex + '/' + hit.geometryIndex + '/' + hit.primitiveIndex);
+  if (!tri) return [1, 0, 1];
+  let n = normalize(cross(sub(tri.b, tri.a), sub(tri.c, tri.a)));
+  if (dot(n, [ray[4], ray[5], ray[6]]) > 0) n = scale(n, -1);
+  const lambert = Math.max(0, dot(n, LIGHT)) * (hit.shadow ? 0 : 1);
+  const base = PALETTE[hit.instanceIndex === 0 ? 0 : 1 + hit.instanceIndex % (PALETTE.length - 1)];
+  return base.map((c) => c * (0.3 + 0.7 * lambert));
+}
+function draw(canvas, W, H, colorAt) {
+  const ctx = canvas.getContext('2d');
+  const img = ctx.createImageData(W, H);
+  for (let i = 0; i < W * H; i++) {
+    const c = colorAt(i);
+    img.data.set([c[0] * 255, c[1] * 255, c[2] * 255, 255], i * 4);
+  }
+  ctx.putImageData(img, 0, 0);
+}
+function parseHits(buffer) {
+  const u = new Uint32Array(buffer), f = new Float32Array(buffer), hits = [];
+  for (let i = 0; i < u.length / HIT_WORDS; i++) {
+    const b = i * HIT_WORDS;
+    hits.push({ kind: u[b], t: f[b + 1], u: f[b + 2], v: f[b + 3], id: u[b + 4], instanceIndex: u[b + 5],
+                geometryIndex: u[b + 6], primitiveIndex: u[b + 7], frontFace: u[b + 8], shadow: u[b + 9] });
+  }
+  return hits;
+}
+// Compares a GPU tracer with the CPU reference. A difference on an ambiguous ray is
+// counted but tolerated; a difference anywhere else is a real mismatch.
+function compare(name, gpu, cpu) {
+  const s = { name, real: 0, ambiguousDiff: 0, ambiguous: 0, hits: 0, maxTErr: 0, maxBaryErr: 0, frontFaceDiff: 0, firstReal: [] , status: [] };
+  for (let i = 0; i < cpu.length; i++) {
+    const g = gpu[i], c = cpu[i];
+    const differs = (g.kind !== c.kind) || (c.kind && (g.id !== c.id || g.instanceIndex !== c.instanceIndex ||
+      g.geometryIndex !== c.geometryIndex || g.primitiveIndex !== c.primitiveIndex || g.shadow !== c.shadow ||
+      Math.abs(g.t - c.t) > 1e-4 * Math.max(1, c.t) || Math.abs(g.u - c.u) > 1e-3 || Math.abs(g.v - c.v) > 1e-3));
+    if (c.ambiguous) s.ambiguous++;
+    if (c.kind) s.hits++;
+    if (differs && c.ambiguous) { s.ambiguousDiff++; s.status.push(1); continue; }
+    if (differs) { s.real++; s.status.push(2); if (s.firstReal.length < 5) s.firstReal.push({ i, g, c }); continue; }
+    s.status.push(0);
+    if (c.kind) {
+      s.maxTErr = Math.max(s.maxTErr, Math.abs(g.t - c.t));
+      s.maxBaryErr = Math.max(s.maxBaryErr, Math.abs(g.u - c.u), Math.abs(g.v - c.v));
+      if (g.frontFace !== c.frontFace) s.frontFaceDiff++;
+    }
+  }
+  return s;
+}
+const describe = (s, n) => `${s.name} vs CPU: ${n} rays, ${s.hits} hits; real mismatches ${s.real}; ` +
+  `grazing rays ${s.ambiguous} (${s.ambiguousDiff} of them differ); max |t err| ${s.maxTErr.toExponential(1)} m; ` +
+  `max barycentric err ${s.maxBaryErr.toExponential(1)}; front-face disagreements ${s.frontFaceDiff}`;
+
+// ---------------------------------------------------------------- WebGPU plumbing
+
+function makeBuffer(device, data, usage) {
+  const buffer = device.createBuffer({ size: Math.max(16, Math.ceil(data.byteLength / 4) * 4), usage: usage | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(buffer, 0, data);
+  return buffer;
+}
+async function readBuffer(device, src, size) {
+  const rb = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(src, 0, rb, 0, size);
+  device.queue.submit([enc.finish()]);
+  await rb.mapAsync(GPUMapMode.READ);
+  const copy = rb.getMappedRange().slice(0);
+  rb.unmap();
+  rb.destroy();
+  return copy;
+}
+function paramsBuffer(device, rayCount, triCount) {
+  const data = new ArrayBuffer(32);
+  new Uint32Array(data, 0, 2).set([rayCount, triCount]);
+  new Float32Array(data, 8, 6).set([SHADOW_TMIN, 0, LIGHT[0], LIGHT[1], LIGHT[2], 0]);
+  return makeBuffer(device, data, GPUBufferUsage.UNIFORM);
+}
+function triangleBuffer(device, tris) {
+  const data = new ArrayBuffer(tris.length * 64), fl = new Float32Array(data), u = new Uint32Array(data);
+  tris.forEach((t, i) => {
+    fl.set([...t.a, 0, ...t.b, 0, ...t.c, 0], i * 16);
+    u.set([t.id, t.instanceIndex, t.geometryIndex, t.primitiveIndex], i * 16 + 12);
+  });
+  return makeBuffer(device, data, GPUBufferUsage.STORAGE);
+}
+
+// Builds the two BLASes once (hardware path).
+function createBlases(device) {
+  const cubeVerts = makeBuffer(device, new Float32Array(CUBE_VERTS.flat()), GPUBufferUsage.VERTEX | GPUBufferUsage.BLAS_INPUT);
+  const cubeIndices = makeBuffer(device, new Uint16Array(CUBE_INDICES), GPUBufferUsage.INDEX | GPUBufferUsage.BLAS_INPUT);
+  const tVerts = makeBuffer(device, new Float32Array(T_GEOMETRIES.flat(2)), GPUBufferUsage.VERTEX | GPUBufferUsage.BLAS_INPUT);
+  const cube = device.createBlas({ label: 'cube', geometries: [
+    { vertexFormat: 'float32x3', vertexCount: 8, indexFormat: 'uint16', indexCount: 36 }] });
+  const tShape = device.createBlas({ label: 'T', geometries: [
+    { vertexFormat: 'float32x3', vertexCount: 36 }, { vertexFormat: 'float32x3', vertexCount: 36 }] });
+  const entries = [
+    { blas: cube, geometries: [{ vertexBuffer: cubeVerts, vertexStride: 12, indexBuffer: cubeIndices }] },
+    { blas: tShape, geometries: [{ vertexBuffer: tVerts, vertexStride: 12 },
+                                 { vertexBuffer: tVerts, vertexStride: 12, firstVertex: 36 }] },
+  ];
+  return { list: [cube, tShape], entries };
+}
+
+// Sets up both tracers for a scene. `hw` is null without ray queries.
+function setUpScene(device, scene, pipelines, blases, tracers) {
+  const rays = cameraRays(scene), count = scene.width * scene.height, tris = worldTriangles(scene);
+  const rayBuf = makeBuffer(device, rays, GPUBufferUsage.STORAGE);
+  const params = paramsBuffer(device, count, tris.length);
+  const hitSize = count * HIT_WORDS * 4;
+  const res = { rays, tris, count, hitSize };
+  if (tracers.sw) {
+    res.swHits = device.createBuffer({ size: hitSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    res.swGroup = device.createBindGroup({ layout: pipelines.sw.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: params } }, { binding: 1, resource: { buffer: rayBuf } },
+      { binding: 2, resource: { buffer: triangleBuffer(device, tris) } }, { binding: 3, resource: { buffer: res.swHits } }] });
+  }
+  if (tracers.hw) {
+    const tlas = device.createTlas({ label: 'scene', maxInstances: scene.instances.length });
+    res.tlasBuild = { tlas, instances: scene.instances.map((it) => ({ blas: blases.list[it.blas], transform: it.m, customData: it.id })) };
+    res.hwHits = device.createBuffer({ size: hitSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    res.hwGroup = device.createBindGroup({ layout: pipelines.hwLayout, entries: [
+      { binding: 0, resource: { buffer: params } }, { binding: 1, resource: { buffer: rayBuf } },
+      { binding: 2, resource: tlas }, { binding: 3, resource: { buffer: res.hwHits } }] });
+  }
+  return res;
+}
+function dispatch(device, pipeline, group, count, encoder, timestampWrites) {
+  const pass = encoder.beginComputePass(timestampWrites ? { timestampWrites } : {});
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, group);
+  pass.dispatchWorkgroups(Math.ceil(count / 64));
+  pass.end();
+}
+
+// Timing. Each measurement puts `perPass` dispatches in one compute pass and reports
+// ms per dispatch: from timestamp queries around the pass (median of `runs`), and
+// from wall-clock time to onSubmittedWorkDone (which also counts Firefox's IPC and
+// wgpu's per-submit work, spread over `perPass`).
+async function timeDispatches(device, pipeline, group, count, perPass, runs, useTimestamps) {
+  const gpu = [], wall = [];
+  for (let r = 0; r < runs; r++) {
+    const enc = device.createCommandEncoder();
+    let qs = null, resolve = null;
+    if (useTimestamps) {
+      qs = device.createQuerySet({ type: 'timestamp', count: 2 });
+      resolve = device.createBuffer({ size: 16, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+    }
+    const pass = enc.beginComputePass(qs ? { timestampWrites: { querySet: qs, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 } } : {});
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, group);
+    for (let i = 0; i < perPass; i++) pass.dispatchWorkgroups(Math.ceil(count / 64));
+    pass.end();
+    if (qs) enc.resolveQuerySet(qs, 0, 2, resolve, 0);
+    await device.queue.onSubmittedWorkDone();
+    const t0 = performance.now();
+    device.queue.submit([enc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    wall.push((performance.now() - t0) / perPass);
+    if (qs) {
+      const ts = new BigUint64Array(await readBuffer(device, resolve, 16));
+      gpu.push(Number(ts[1] - ts[0]) / 1e6 / perPass);
+    }
+  }
+  const median = (a) => a.length ? a.sort((x, y) => x - y)[a.length >> 1] : NaN;
+  return { gpu: median(gpu), wall: median(wall) };
+}
+const fmt = (ms) => Number.isNaN(ms) ? 'n/a' : ms.toFixed(3) + ' ms';
+
+// ---------------------------------------------------------------- main
+
+try {
+  log('userAgent: ' + navigator.userAgent);
+  if (!navigator.gpu) throw new Error('navigator.gpu is missing');
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) throw new Error('requestAdapter returned null');
+  const hasRayQuery = adapter.features.has('experimental-ray-query') && typeof GPUDevice.prototype.createBlas === 'function';
+  const hasTimestamps = adapter.features.has('timestamp-query');
+  log(`hardware ray queries: ${hasRayQuery ? 'yes' : 'no (software and CPU only)'}; timestamp queries: ${hasTimestamps ? 'yes' : 'no'}`);
+  const requiredFeatures = [];
+  if (hasRayQuery) requiredFeatures.push('experimental-ray-query');
+  if (hasTimestamps) requiredFeatures.push('timestamp-query');
+  const device = await adapter.requestDevice({ requiredFeatures });
+  device.addEventListener('uncapturederror', (e) => log('uncapturederror: ' + e.error.message));
+  device.pushErrorScope('validation');
+
+  const pipelines = {};
+  const swModule = device.createShaderModule({ code: SOFTWARE_WGSL });
+  pipelines.sw = device.createComputePipeline({ layout: 'auto', compute: { module: swModule, entryPoint: 'main' } });
+  let blases = null;
+  if (hasRayQuery) {
+    const hwModule = device.createShaderModule({ code: HARDWARE_WGSL });
+    for (const m of (await hwModule.getCompilationInfo()).messages) log(`hardware shader ${m.type}: ${m.message} (line ${m.lineNum})`);
+    pipelines.hwLayout = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, accelerationStructure: {} },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } }] });
+    pipelines.hw = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [pipelines.hwLayout] }),
+      compute: { module: hwModule, entryPoint: 'main' } });
+    blases = createBlases(device);
+  }
+
+  // ---- correctness: the main scene
+  const scene = mainScene();
+  const S = setUpScene(device, scene, pipelines, blases, { sw: true, hw: hasRayQuery });
+  log(`scene: ${scene.instances.length} instances, ${S.tris.length} triangles, ${scene.width}x${scene.height} pixels, primary + shadow ray each`);
+  const enc = device.createCommandEncoder();
+  if (hasRayQuery) {
+    enc.buildAccelerationStructures(blases.entries, [S.tlasBuild]);
+    dispatch(device, pipelines.hw, S.hwGroup, S.count, enc);
+  }
+  dispatch(device, pipelines.sw, S.swGroup, S.count, enc);
+  device.queue.submit([enc.finish()]);
+  const err = await device.popErrorScope();
+  if (err) throw new Error('validation error: ' + err.message);
+
+  const swHits = parseHits(await readBuffer(device, S.swHits, S.hitSize));
+  const hwHits = hasRayQuery ? parseHits(await readBuffer(device, S.hwHits, S.hitSize)) : null;
+
+  const t0 = performance.now();
+  const cpu = [];
+  for (let i = 0; i < S.count; i++) {
+    const r = S.rays.subarray(i * 8, i * 8 + 8), o = [r[0], r[1], r[2]], d = [r[4], r[5], r[6]];
+    const prim = cpuTrace(S.tris, o, d, r[3], r[7], false);
+    const h = { kind: 0, ambiguous: prim.ambiguous };
+    if (prim.best) {
+      const tr = S.tris[prim.best.tri];
+      Object.assign(h, { kind: 1, t: prim.best.t, u: prim.best.u, v: prim.best.v, id: tr.id, instanceIndex: tr.instanceIndex,
+        geometryIndex: tr.geometryIndex, primitiveIndex: tr.primitiveIndex, frontFace: prim.best.det > 0 ? 1 : 0 });
+      const shadow = cpuTrace(S.tris, add(o, scale(d, prim.best.t)), LIGHT, SHADOW_TMIN, 1e4, true);
+      h.shadow = shadow.best ? 1 : 0;
+      h.ambiguous = h.ambiguous || shadow.ambiguous;
+    }
+    cpu.push(h);
+  }
+  log(`CPU reference took ${(performance.now() - t0).toFixed(0)} ms`);
+
+  const triByKey = new Map(S.tris.map((t) => [t.instanceIndex + '/' + t.geometryIndex + '/' + t.primitiveIndex, t]));
+  const W = scene.width, H = scene.height, ray = (i) => S.rays.subarray(i * 8, i * 8 + 8);
+  draw(document.getElementById('c-cpu'), W, H, (i) => shade(cpu[i], ray(i), triByKey));
+  draw(document.getElementById('c-sw'), W, H, (i) => shade(swHits[i], ray(i), triByKey));
+  const swStats = compare('software', swHits, cpu);
+  log(describe(swStats, S.count));
+  let hwStats = null;
+  if (hwHits) {
+    draw(document.getElementById('c-hw'), W, H, (i) => shade(hwHits[i], ray(i), triByKey));
+    hwStats = compare('hardware', hwHits, cpu);
+    log(describe(hwStats, S.count));
+  }
+  const worst = (i) => Math.max(swStats.status[i], hwStats ? hwStats.status[i] : 0);
+  draw(document.getElementById('c-diff'), W, H, (i) => [[0.35, 0.35, 0.35], [0.95, 0.7, 0.1], [0.9, 0.1, 0.1]][worst(i)]);
+  for (const s of [hwStats, swStats]) for (const { i, g, c } of (s ? s.firstReal : [])) {
+    log(`${s.name} mismatch at pixel (${i % W}, ${(i / W) | 0}): gpu ${JSON.stringify(g)} cpu ${JSON.stringify(c)}`);
+  }
+  // The four images as one PNG, for saving from a terminal log.
+  const sheet = document.createElement('canvas');
+  sheet.width = W * 2; sheet.height = H * 2;
+  ['c-hw', 'c-sw', 'c-cpu', 'c-diff'].forEach((id, k) =>
+    sheet.getContext('2d').drawImage(document.getElementById(id), (k % 2) * W, (k >> 1) * H));
+  console.log('RAYQUERY-BOXES-PNG ' + sheet.toDataURL('image/png'));
+
+  // ---- rough timing: a bigger scene
+  const big = timingScene();
+  const B = setUpScene(device, big, pipelines, blases, { sw: true, hw: hasRayQuery });
+  if (hasRayQuery) {
+    const e = device.createCommandEncoder();
+    e.buildAccelerationStructures([], [B.tlasBuild]);
+    device.queue.submit([e.finish()]);
+  }
+  // GPU timestamps are the measure here. In Firefox, onSubmittedWorkDone resolved on
+  // a ~100 ms cycle in testing, so wall-clock times are logged only as a sanity check.
+  log(`timing scene: ${big.instances.length} instances, ${B.tris.length} triangles, ${big.width}x${big.height} pixels, ` +
+      `primary + shadow ray each; ms per dispatch, median of 5 runs`);
+  const sw1 = await timeDispatches(device, pipelines.sw, B.swGroup, B.count, 1, 5, hasTimestamps);
+  const sw5 = await timeDispatches(device, pipelines.sw, B.swGroup, B.count, 5, 5, hasTimestamps);
+  log(`software (brute force): GPU ${fmt(sw1.gpu)} (1 per pass), ${fmt(sw5.gpu)} (5 per pass); wall ${fmt(sw1.wall)}, ${fmt(sw5.wall)}`);
+  if (hasRayQuery) {
+    const hw1 = await timeDispatches(device, pipelines.hw, B.hwGroup, B.count, 1, 5, hasTimestamps);
+    const hw100 = await timeDispatches(device, pipelines.hw, B.hwGroup, B.count, 100, 5, hasTimestamps);
+    log(`hardware ray queries: GPU ${fmt(hw1.gpu)} (1 per pass), ${fmt(hw100.gpu)} (100 per pass); wall ${fmt(hw1.wall)}, ${fmt(hw100.wall)}`);
+    // Check the timed hardware run did the work: compare it with the software result.
+    const bh = parseHits(await readBuffer(device, B.hwHits, B.hitSize));
+    const bs = parseHits(await readBuffer(device, B.swHits, B.hitSize));
+    let hitsHw = 0, differ = 0;
+    for (let i = 0; i < bh.length; i++) {
+      hitsHw += bh[i].kind;
+      if (bh[i].kind !== bs[i].kind || (bh[i].kind && (bh[i].instanceIndex !== bs[i].instanceIndex ||
+          bh[i].primitiveIndex !== bs[i].primitiveIndex || bh[i].shadow !== bs[i].shadow))) differ++;
+    }
+    log(`timing scene check: hardware hits ${hitsHw} of ${bh.length} rays; hardware and software differ on ${differ} rays (${(100 * differ / bh.length).toFixed(3)}%, edge cases expected)`);
+    if (hasTimestamps) {
+      const rays = B.count + hitsHw;  // primary rays plus one shadow ray per hit
+      log(`hardware vs brute-force software by GPU timestamps: ${(sw5.gpu / hw100.gpu).toFixed(0)}x faster; ` +
+          `hardware ${(rays / hw100.gpu / 1e6).toFixed(1)} G rays/s on this scene. ` +
+          `Brute force is a weak baseline; a BVH software tracer would close much of the gap.`);
+    }
+  }
+
+  const ok = swStats.real === 0 && (!hwStats || hwStats.real === 0);
+  const what = hwStats ? 'hardware and software both match the CPU reference' : 'software matches the CPU reference (no hardware ray queries here)';
+  finish(ok, ok ? what : 'real mismatches found; see the log');
+} catch (e) {
+  finish(false, String(e && e.message || e));
+}
+</script>
+</body>
+</html>
