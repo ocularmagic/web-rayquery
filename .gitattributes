@@ -1,0 +1,2 @@
+# Keep patches byte-exact so `git apply` works on any OS.
+*.patch text eol=lf
