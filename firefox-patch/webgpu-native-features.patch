@@ -1638,6 +1638,99 @@ index ff229df871ad..bf3318ad8007 100644
  
    static already_AddRefed<Instance> Create(nsIGlobalObject* aGlobal);
  
+diff --git a/dom/webgpu/PipelineCache.cpp b/dom/webgpu/PipelineCache.cpp
+new file mode 100644
+index 000000000000..27eddb1341da
+--- /dev/null
++++ b/dom/webgpu/PipelineCache.cpp
+@@ -0,0 +1,35 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "PipelineCache.h"
++
++#include "Device.h"
++#include "ipc/WebGPUChild.h"
++#include "mozilla/dom/Promise.h"
++#include "mozilla/dom/WebGPUBinding.h"
++
++namespace mozilla::webgpu {
++
++GPU_IMPL_CYCLE_COLLECTION(PipelineCache, mParent)
++GPU_IMPL_JS_WRAP(PipelineCache)
++
++PipelineCache::PipelineCache(Device* const aParent, RawId aId)
++    : ObjectBase(aParent->GetChild(), aId,
++                 ffi::wgpu_client_drop_pipeline_cache),
++      ChildOf(aParent) {}
++
++PipelineCache::~PipelineCache() = default;
++
++already_AddRefed<dom::Promise> PipelineCache::GetData(ErrorResult& aRv) {
++  RefPtr<dom::Promise> promise = dom::Promise::Create(GetParentObject(), aRv);
++  if (aRv.Failed()) {
++    return nullptr;
++  }
++  ffi::wgpu_client_pipeline_cache_get_data(GetClient(), GetId());
++  GetChild()->EnqueuePipelineCacheDataPromise(
++      PendingPipelineCacheDataPromise{promise, GetId()});
++  return promise.forget();
++}
++
++}  // namespace mozilla::webgpu
+diff --git a/dom/webgpu/PipelineCache.h b/dom/webgpu/PipelineCache.h
+new file mode 100644
+index 000000000000..d3b0b6459668
+--- /dev/null
++++ b/dom/webgpu/PipelineCache.h
+@@ -0,0 +1,46 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// Prototype: pipeline caches (dom.webgpu.experimental-ray-query.enabled,
++// feature "wgpu-pipeline-cache").
++
++#ifndef GPU_PipelineCache_H_
++#define GPU_PipelineCache_H_
++
++#include "ObjectModel.h"
++#include "mozilla/webgpu/WebGPUTypes.h"
++#include "nsWrapperCache.h"
++
++namespace mozilla {
++class ErrorResult;
++
++namespace dom {
++class Promise;
++}  // namespace dom
++
++namespace webgpu {
++
++class Device;
++
++// `GPUPipelineCache`. Pipelines created with it as their `cache` reuse and add
++// to its compiled shaders; `getData()` returns them as bytes to pass as
++// `data` on a later run.
++class PipelineCache final : public nsWrapperCache,
++                            public ObjectBase,
++                            public ChildOf<Device> {
++ public:
++  GPU_DECL_CYCLE_COLLECTION(PipelineCache)
++  GPU_DECL_JS_WRAP(PipelineCache)
++
++  PipelineCache(Device* const aParent, RawId aId);
++  already_AddRefed<dom::Promise> GetData(ErrorResult& aRv);
++
++ private:
++  virtual ~PipelineCache();
++};
++
++}  // namespace webgpu
++}  // namespace mozilla
++
++#endif  // GPU_PipelineCache_H_
 diff --git a/dom/webgpu/PromiseHelpers.cpp b/dom/webgpu/PromiseHelpers.cpp
 index 479392665c37..fd16e4f61e2a 100644
 --- a/dom/webgpu/PromiseHelpers.cpp
